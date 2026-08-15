@@ -26,7 +26,7 @@ A lightweight, interactive Terminal UI (TUI) VHF airband scanner for RTL-SDR don
 ## Quick Install (All Machines)
 
 ```bash
-git clone [https://github.com/UPMI-Scanner/airscan.git](https://github.com/UPMI-Scanner/airscan.git) ~/airscan
+git clone https://github.com/UPMI-Scanner/airscan.git ~/airscan
 cd ~/airscan
 chmod +x install-airscan.sh
 ./install-airscan.sh
