@@ -15,7 +15,7 @@ from datetime import datetime
 # -------------------------------------------------------------
 # BASE DIRECTORY & FILE PATHS
 # -------------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CSV_FILE = os.path.join(BASE_DIR, "frequencies.csv")
 RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
