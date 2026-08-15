@@ -406,6 +406,31 @@ def gui(stdscr, scanner):
         h, w = stdscr.getmaxyx()
         if h < 14 or w < 60:
             stdscr.erase()
+        # Terminal boundary & size protection
+        max_y, max_x = stdscr.getmaxyx()
+        min_lines = max(16, len(channels) + 8)
+        min_cols = 65
+
+        if max_y < min_lines or max_x < min_cols:
+            stdscr.erase()
+            w_title = "! TERMINAL WINDOW TOO SMALL !"
+            w_stats = f"Size: {max_x}x{max_y}  (Min: {min_cols}x{min_lines})"
+            w_hint  = "Expand window to resume scanning..."
+            
+            mid_y = max_y // 2
+            try:
+                if mid_y - 1 >= 0 and max_x > len(w_title):
+                    stdscr.addstr(mid_y - 1, (max_x - len(w_title)) // 2, w_title, curses.A_BOLD)
+                if mid_y >= 0 and max_x > len(w_stats):
+                    stdscr.addstr(mid_y, (max_x - len(w_stats)) // 2, w_stats)
+                if mid_y + 1 < max_y and max_x > len(w_hint):
+                    stdscr.addstr(mid_y + 1, (max_x - len(w_hint)) // 2, w_hint, curses.A_DIM)
+            except curses.error:
+                pass
+            stdscr.refresh()
+            time.sleep(0.05)
+            continue
+
             safe_addstr(stdscr, 1, 2, "Terminal too small. Please resize.", curses.A_BOLD)
             stdscr.refresh()
             time.sleep(0.2)
@@ -487,6 +512,11 @@ def gui(stdscr, scanner):
 
         try:
             key = stdscr.getch()
+            if key == curses.KEY_RESIZE:
+                curses.update_lines_cols()
+                stdscr.clear()
+                stdscr.refresh()
+                continue
         except:
             key = -1
 
