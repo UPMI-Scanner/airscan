@@ -41,7 +41,7 @@ try:
 except Exception as e:
     sys.exit(f"Error loading librtlsdr: {e}")
 
-# Function prototypes
+# Explicit Ctypes Function Signatures
 librtlsdr.rtlsdr_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32]
 librtlsdr.rtlsdr_open.restype = ctypes.c_int
 
@@ -94,19 +94,25 @@ class NativeRtlSdr:
         self.set_gain(self.gain)
 
     def set_sample_rate(self, rate):
-        librtlsdr.rtlsdr_set_sample_rate(self.dev, int(rate))
+        if self.dev:
+            librtlsdr.rtlsdr_set_sample_rate(self.dev, int(rate))
 
-    def set_center_freq(self, freq):
-        librtlsdr.rtlsdr_set_center_freq(self.dev, int(freq))
+    def set_center_freq(self, freq_hz):
+        if self.dev:
+            librtlsdr.rtlsdr_set_center_freq(self.dev, int(freq_hz))
 
     def set_gain(self, gain_db):
         self.gain = float(gain_db)
-        librtlsdr.rtlsdr_set_tuner_gain(self.dev, int(gain_db * 10))
+        if self.dev:
+            librtlsdr.rtlsdr_set_tuner_gain(self.dev, int(gain_db * 10))
 
     def reset_buffer(self):
-        librtlsdr.rtlsdr_reset_buffer(self.dev)
+        if self.dev:
+            librtlsdr.rtlsdr_reset_buffer(self.dev)
 
     def read_samples(self, num_samples=16384):
+        if not self.dev:
+            return np.zeros(num_samples, dtype=np.complex64)
         num_bytes = num_samples * 2
         buf = (ctypes.c_ubyte * num_bytes)()
         n_read = ctypes.c_int()
@@ -121,8 +127,9 @@ class NativeRtlSdr:
 
     def close(self):
         if self.dev:
-            librtlsdr.rtlsdr_close(self.dev)
+            d = self.dev
             self.dev = None
+            librtlsdr.rtlsdr_close(d)
 
 
 # -------------------------------------------------------------
@@ -209,7 +216,10 @@ class AirbandScanner:
         self.stream.start()
 
     def set_frequency(self, freq_mhz):
-        self.sdr.set_center_freq(int(freq_mhz * 1e6))
+        # Validate frequency bounds (24 MHz - 1766 MHz)
+        hz = int(float(freq_mhz) * 1e6)
+        if 24000000 <= hz <= 1766000000:
+            self.sdr.set_center_freq(hz)
 
     def calculate_rssi(self, samples):
         p = np.mean(np.abs(samples)**2)
@@ -217,7 +227,6 @@ class AirbandScanner:
 
     def demodulate_am(self, samples):
         mag = np.abs(samples)
-        # Vectorized boxcar average decimation (anti-aliasing)
         n_blocks = len(mag) // DECIMATION
         audio = mag[:n_blocks * DECIMATION].reshape(n_blocks, DECIMATION).mean(axis=1)
         
@@ -225,7 +234,7 @@ class AirbandScanner:
         audio = audio - np.mean(audio)
         
         # Smooth EMA AGC
-        chunk_peak = float(np.max(np.abs(audio)))
+        chunk_peak = float(np.max(np.abs(audio))) if len(audio) > 0 else 0.01
         self.agc_peak = max(chunk_peak, (self.agc_peak * 0.96) + (chunk_peak * 0.04))
         
         target_gain = 0.85 / max(self.agc_peak, 0.01)
@@ -289,8 +298,8 @@ class AirbandScanner:
                 ch = self.channels[self.current_idx]
                 freq = ch["freq"]
 
-            self.set_frequency(freq)
             self.sdr.reset_buffer()
+            self.set_frequency(freq)
             time.sleep(0.015)
 
             samples = self.sdr.read_samples(16384)
@@ -316,7 +325,10 @@ class AirbandScanner:
 
                     audio = self.demodulate_am(samples)
                     play_audio = np.clip(audio * self.volume, -1.0, 1.0)
-                    self.stream.write(play_audio)
+                    try:
+                        self.stream.write(play_audio)
+                    except Exception:
+                        pass
 
                     if self.recording and self.vox_active:
                         with self.rec_lock:
@@ -353,7 +365,7 @@ class AirbandScanner:
         self.sdr.close()
 
 
-def draw_meter(rssi, squelch, width=20):
+def draw_meter(rssi, squelch, width=18):
     norm_val = int(np.clip((rssi + 60) / 60 * width, 0, width))
     norm_sq = int(np.clip((squelch + 60) / 60 * width, 0, width))
     bar = list(" " * width)
@@ -403,14 +415,14 @@ def gui(stdscr, scanner):
     curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)
 
     while scanner.running:
-        h, w = stdscr.getmaxyx()
-        if h < 14 or w < 60:
-            stdscr.erase()
-        # Terminal boundary & size protection
         max_y, max_x = stdscr.getmaxyx()
-        min_lines = max(16, len(channels) + 8)
+        with scanner.channel_lock:
+            num_channels = len(scanner.channels)
+        
+        min_lines = max(16, num_channels + 8)
         min_cols = 65
 
+        # Dynamic size check
         if max_y < min_lines or max_x < min_cols:
             stdscr.erase()
             w_title = "! TERMINAL WINDOW TOO SMALL !"
@@ -431,10 +443,8 @@ def gui(stdscr, scanner):
             time.sleep(0.05)
             continue
 
-            safe_addstr(stdscr, 1, 2, "Terminal too small. Please resize.", curses.A_BOLD)
-            stdscr.refresh()
-            time.sleep(0.2)
-            continue
+        stdscr.erase()
+        h, w = max_y, max_x
 
         # Header Box
         safe_addstr(stdscr, 1, 2, "┌" + "─" * (w - 6) + "┐", curses.color_pair(1) | curses.A_BOLD)
@@ -454,7 +464,7 @@ def gui(stdscr, scanner):
         safe_addstr(stdscr, 4, 28, "MP3 VOX REC: ")
         if scanner.recording:
             if scanner.vox_active:
-                safe_addstr(stdscr, 4, 41, "● VOX CAPTURING", curses.color_pair(3) | curses.A_BOLD | curses.A_BLINK)
+                safe_addstr(stdscr, 4, 41, "● VOX CAPTURING", curses.color_pair(3) | curses.A_BOLD)
             else:
                 safe_addstr(stdscr, 4, 41, "○ VOX WAITING  ", curses.color_pair(3))
         else:
@@ -480,7 +490,6 @@ def gui(stdscr, scanner):
         safe_addstr(stdscr, 9, 2, "  " + "─" * (w - 6), curses.color_pair(1) | curses.A_BOLD)
 
         with scanner.channel_lock:
-            num_channels = len(scanner.channels)
             max_visible = max(1, h - 14)
             scroll_offset = max(0, min(scanner.selected_row - max_visible + 1, num_channels - max_visible))
             
@@ -517,7 +526,7 @@ def gui(stdscr, scanner):
                 stdscr.clear()
                 stdscr.refresh()
                 continue
-        except:
+        except Exception:
             key = -1
 
         if key in [ord('q'), ord('Q')]:
