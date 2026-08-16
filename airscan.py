@@ -13,7 +13,7 @@ import sounddevice as sd
 from datetime import datetime
 
 # -------------------------------------------------------------
-# BASE DIRECTORY & FILE PATHS
+# BASE DIRECTORY & FILE PATHS (Resolves Symlinks)
 # -------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CSV_FILE = os.path.join(BASE_DIR, "frequencies.csv")
@@ -41,7 +41,6 @@ try:
 except Exception as e:
     sys.exit(f"Error loading librtlsdr: {e}")
 
-# Explicit Ctypes Function Signatures
 librtlsdr.rtlsdr_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32]
 librtlsdr.rtlsdr_open.restype = ctypes.c_int
 
@@ -190,14 +189,14 @@ class AirbandScanner:
         self.running = True
         self.held = False
         
-        # Audio AGC peak tracker
         self.agc_peak = 0.05
         
-        # Recording state & locks
+        # Recording state & timing
         self.recording = False
         self.vox_active = False
         self.ffmpeg_proc = None
         self.rec_filename = ""
+        self.rec_start_time = 0.0
         self.total_vox_samples = 0
         self.rec_lock = threading.Lock()
         self.channel_lock = threading.Lock()
@@ -216,7 +215,6 @@ class AirbandScanner:
         self.stream.start()
 
     def set_frequency(self, freq_mhz):
-        # Validate frequency bounds (24 MHz - 1766 MHz)
         hz = int(float(freq_mhz) * 1e6)
         if 24000000 <= hz <= 1766000000:
             self.sdr.set_center_freq(hz)
@@ -229,18 +227,14 @@ class AirbandScanner:
         mag = np.abs(samples)
         n_blocks = len(mag) // DECIMATION
         audio = mag[:n_blocks * DECIMATION].reshape(n_blocks, DECIMATION).mean(axis=1)
-        
-        # Remove DC offset
         audio = audio - np.mean(audio)
         
-        # Smooth EMA AGC
         chunk_peak = float(np.max(np.abs(audio))) if len(audio) > 0 else 0.01
         self.agc_peak = max(chunk_peak, (self.agc_peak * 0.96) + (chunk_peak * 0.04))
         
         target_gain = 0.85 / max(self.agc_peak, 0.01)
         target_gain = min(target_gain, 12.0)
         audio = audio * target_gain
-        
         return np.clip(audio, -1.0, 1.0).astype(np.float32)
 
     def add_channel(self, freq, name):
@@ -255,6 +249,7 @@ class AirbandScanner:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 self.rec_filename = os.path.join(RECORDINGS_DIR, f"Airband_VOX_{ts}.mp3")
                 self.total_vox_samples = 0
+                self.rec_start_time = time.time()
                 
                 cmd = [
                     'ffmpeg', '-y',
@@ -282,11 +277,12 @@ class AirbandScanner:
                     self.ffmpeg_proc = None
 
     def get_duration_str(self):
-        total_sec = int(self.total_vox_samples / AUDIO_RATE)
-        hrs = total_sec // 3600
-        mins = (total_sec % 3600) // 60
-        secs = total_sec % 60
-        return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+        if not self.recording:
+            return "00:00:00"
+        vox_sec = int(self.total_vox_samples / AUDIO_RATE)
+        v_mins = (vox_sec % 3600) // 60
+        v_secs = vox_sec % 60
+        return f"{v_mins:02d}:{v_secs:02d} (VOX)"
 
     def worker_loop(self):
         while self.running:
@@ -336,6 +332,7 @@ class AirbandScanner:
                                 pcm16 = (audio * 32767).astype(np.int16).tobytes()
                                 try:
                                     self.ffmpeg_proc.stdin.write(pcm16)
+                                    self.ffmpeg_proc.stdin.flush()
                                     self.total_vox_samples += len(audio)
                                 except (BrokenPipeError, OSError, ValueError):
                                     pass
@@ -397,14 +394,16 @@ def prompt_user_input(stdscr, prompt_text, y, x, max_len=25):
     
     curses.noecho()
     curses.curs_set(0)
-    stdscr.nodelay(True)
+    stdscr.nodelay(False)
+    stdscr.timeout(60)
     return val
 
 
 def gui(stdscr, scanner):
     curses.curs_set(0)
-    stdscr.nodelay(True)
-    stdscr.timeout(80)
+    stdscr.keypad(True)
+    stdscr.nodelay(False)
+    stdscr.timeout(60)
 
     curses.start_color()
     curses.use_default_colors()
@@ -427,7 +426,7 @@ def gui(stdscr, scanner):
             stdscr.erase()
             w_title = "! TERMINAL WINDOW TOO SMALL !"
             w_stats = f"Size: {max_x}x{max_y}  (Min: {min_cols}x{min_lines})"
-            w_hint  = "Expand window to resume scanning..."
+            w_hint  = "Expand window or press 'q' to exit"
             
             mid_y = max_y // 2
             try:
@@ -440,7 +439,11 @@ def gui(stdscr, scanner):
             except curses.error:
                 pass
             stdscr.refresh()
-            time.sleep(0.05)
+            
+            k = stdscr.getch()
+            if k in [ord('q'), ord('Q')]:
+                scanner.running = False
+                break
             continue
 
         stdscr.erase()
@@ -464,14 +467,14 @@ def gui(stdscr, scanner):
         safe_addstr(stdscr, 4, 28, "MP3 VOX REC: ")
         if scanner.recording:
             if scanner.vox_active:
-                safe_addstr(stdscr, 4, 41, "● VOX CAPTURING", curses.color_pair(3) | curses.A_BOLD)
+                safe_addstr(stdscr, 4, 41, "● CAPTURING", curses.color_pair(3) | curses.A_BOLD)
             else:
-                safe_addstr(stdscr, 4, 41, "○ VOX WAITING  ", curses.color_pair(3))
+                safe_addstr(stdscr, 4, 41, "○ WAITING  ", curses.color_pair(3))
         else:
-            safe_addstr(stdscr, 4, 41, "OFF / STANDBY  ", curses.A_DIM)
+            safe_addstr(stdscr, 4, 41, "OFF/STANDBY", curses.A_DIM)
 
         dur_str = scanner.get_duration_str()
-        safe_addstr(stdscr, 4, 59, f"LEN: [{dur_str}]", curses.A_BOLD if scanner.recording else curses.A_DIM)
+        safe_addstr(stdscr, 4, 55, f"AUDIO: [{dur_str}]", curses.A_BOLD if scanner.recording else curses.A_DIM)
 
         # Telemetry & S-Meter
         meter_str = draw_meter(scanner.current_rssi, scanner.squelch, width=18)
@@ -517,7 +520,7 @@ def gui(stdscr, scanner):
         # Bottom Footer Controls
         footer_y = max(11 + max_visible, h - 3)
         safe_addstr(stdscr, footer_y, 2, "─" * (w - 4), curses.color_pair(1))
-        safe_addstr(stdscr, footer_y + 1, 2, " [A] Add Ch  [R] VOX Rec  [+/-] Squelch  [SPACE] Hold/Scan  [G] Gain  [Q] Quit ", curses.color_pair(1))
+        safe_addstr(stdscr, footer_y + 1, 2, " [A] Add Ch  [R] Rec  [+/-] Squelch  [SPACE] Hold  [UP/DN] Select  [G] Gain  [Q] Quit ", curses.color_pair(1))
 
         try:
             key = stdscr.getch()
@@ -554,13 +557,13 @@ def gui(stdscr, scanner):
             scanner.held = not scanner.held
             if scanner.held:
                 scanner.current_idx = scanner.selected_row
-        elif key in [curses.KEY_UP, ord('k')]:
+        elif key in [curses.KEY_UP, ord('k'), ord('K')]:
             if num_channels > 0:
                 scanner.selected_row = (scanner.selected_row - 1) % num_channels
-        elif key in [curses.KEY_DOWN, ord('j')]:
+        elif key in [curses.KEY_DOWN, ord('j'), ord('J')]:
             if num_channels > 0:
                 scanner.selected_row = (scanner.selected_row + 1) % num_channels
-        elif key in [10, 13]:
+        elif key in [10, 13, curses.KEY_ENTER]:
             scanner.current_idx = scanner.selected_row
             scanner.held = True
         elif key in [ord('g'), ord('G')]:
