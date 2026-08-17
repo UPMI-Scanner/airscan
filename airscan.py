@@ -132,7 +132,7 @@ class NativeRtlSdr:
 
 
 # -------------------------------------------------------------
-# FREQUENCY CSV MANAGEMENT
+# FREQUENCY CSV & TIME MANAGEMENT
 # -------------------------------------------------------------
 DEFAULT_CHANNELS = [
     (123.025, "Helo Air-to-Air"),
@@ -145,6 +145,18 @@ DEFAULT_CHANNELS = [
     (133.550, "Enroute Center"),
     (122.800, "UNICOM / Advisory")
 ]
+
+def format_airtime(seconds):
+    if seconds <= 0:
+        return "00:00"
+    s = int(seconds)
+    mins = s // 60
+    secs = s % 60
+    if mins >= 60:
+        hrs = mins // 60
+        mins = mins % 60
+        return f"{hrs}h {mins:02d}m"
+    return f"{mins:02d}:{secs:02d}"
 
 def load_channels():
     channels = []
@@ -162,11 +174,11 @@ def load_channels():
             try:
                 freq = float(row[0].strip())
                 name = row[1].strip() if len(row) > 1 else f"Ch {len(channels)+1}"
-                channels.append({"freq": freq, "name": name, "hits": 0, "last": "Never"})
+                channels.append({"freq": freq, "name": name, "hits": 0, "active_sec": 0.0, "last": "0"})
             except ValueError:
                 continue
 
-    return channels if channels else [{"freq": 122.800, "name": "UNICOM", "hits": 0, "last": "Never"}]
+    return channels if channels else [{"freq": 122.800, "name": "UNICOM", "hits": 0, "active_sec": 0.0, "last": "0"}]
 
 def append_channel_to_csv(freq, name):
     with open(CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
@@ -239,14 +251,15 @@ class AirbandScanner:
 
     def add_channel(self, freq, name):
         with self.channel_lock:
-            self.channels.append({"freq": freq, "name": name, "hits": 0, "last": "Never"})
+            self.channels.append({"freq": freq, "name": name, "hits": 0, "active_sec": 0.0, "last": "0"})
             append_channel_to_csv(freq, name)
 
     def clear_hits(self):
         with self.channel_lock:
             for ch in self.channels:
                 ch["hits"] = 0
-                ch["last"] = "Never"
+                ch["active_sec"] = 0.0
+                ch["last"] = "0"
 
     def toggle_record(self):
         with self.rec_lock:
@@ -291,6 +304,7 @@ class AirbandScanner:
         return f"{v_mins:02d}:{v_secs:02d}"
 
     def worker_loop(self):
+        chunk_time = 16384 / SAMPLE_RATE
         while self.running:
             with self.channel_lock:
                 if not self.channels:
@@ -311,7 +325,7 @@ class AirbandScanner:
                 self.status = "LOCKED" if not self.held else "HOLD"
                 with self.channel_lock:
                     ch["hits"] += 1
-                    ch["last"] = datetime.now().strftime("%H:%M:%S")
+                    ch["last"] = datetime.now().strftime("%I:%M:%S %p")
 
                 hang_counter = 0
                 while self.running and (self.held or hang_counter < 6):
@@ -324,6 +338,8 @@ class AirbandScanner:
                     else:
                         hang_counter = 0
                         self.vox_active = True
+                        with self.channel_lock:
+                            ch["active_sec"] += chunk_time
 
                     audio = self.demodulate_am(samples)
                     play_audio = np.clip(audio * self.volume, -1.0, 1.0)
@@ -388,7 +404,7 @@ def safe_addstr(stdscr, y, x, text, attr=0):
             pass
 
 
-def prompt_user_input(stdscr, prompt_text, y, x, max_len=25):
+def prompt_user_input(stdscr, prompt_text, y, x, max_len=22):
     curses.echo()
     curses.curs_set(1)
     stdscr.nodelay(False)
@@ -420,14 +436,13 @@ def gui(stdscr, scanner):
     curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)
 
     MIN_LINES = 14
-    MIN_COLS = 60
+    MIN_COLS = 75
 
     while scanner.running:
         max_y, max_x = stdscr.getmaxyx()
         with scanner.channel_lock:
             num_channels = len(scanner.channels)
 
-        # Dynamic size check (prevents crashes on narrow/short terminals)
         if max_y < MIN_LINES or max_x < MIN_COLS:
             stdscr.erase()
             w_title = "! TERMINAL WINDOW TOO SMALL !"
@@ -456,7 +471,7 @@ def gui(stdscr, scanner):
         stdscr.erase()
         h, w = max_y, max_x
 
-        # Generic Header Box (Clean, non-regional title)
+        # Header Box
         safe_addstr(stdscr, 1, 2, "┌" + "─" * (w - 6) + "┐", curses.color_pair(1) | curses.A_BOLD)
         safe_addstr(stdscr, 2, 2, ("│  AIRSCAN - SDR AIRBAND MONITOR & SCANNER").ljust(w - 5) + "│", curses.color_pair(1) | curses.A_BOLD)
         safe_addstr(stdscr, 3, 2, "└" + "─" * (w - 6) + "┘", curses.color_pair(1) | curses.A_BOLD)
@@ -495,9 +510,10 @@ def gui(stdscr, scanner):
         else:
             safe_addstr(stdscr, 6, 32, " " * (w - 34))
 
-        # Channel Table Header
-        safe_addstr(stdscr, 8, 2, f"  {'CH':<4} {'FREQ (MHz)':<12} {'CHANNEL / AGENCY':<20} {'HITS':<8} {'LAST HEARD':<12}", curses.color_pair(1) | curses.A_BOLD)
-        safe_addstr(stdscr, 9, 2, "  " + "─" * (w - 6), curses.color_pair(1) | curses.A_BOLD)
+        # Channel Table Header (Aligned layout with guaranteed width boundaries)
+        header_text = f"  {'CH':<4} {'FREQ (MHz)':<12} {'CHANNEL / AGENCY':<22} {'HITS':<6} {'AIRTIME':<9} {'LAST HEARD':<12}"
+        safe_addstr(stdscr, 8, 2, header_text, curses.color_pair(1) | curses.A_BOLD)
+        safe_addstr(stdscr, 9, 2, "─" * (w - 4), curses.color_pair(1))
 
         with scanner.channel_lock:
             max_visible = max(1, h - 14)
@@ -512,7 +528,10 @@ def gui(stdscr, scanner):
                     is_selected = (i == scanner.selected_row)
 
                     prefix = "► " if is_active else "  "
-                    line = f"{prefix}{i+1:<4} {ch['freq']:<12.3f} {ch['name']:<20} {ch['hits']:<8} {ch['last']:<12}"
+                    airtime_str = format_airtime(ch.get("active_sec", 0.0))
+                    name_str = ch['name'][:21]  # Strict clip prevents pushing subsequent columns
+                    
+                    line = f"{prefix}{i+1:<4} {ch['freq']:<12.3f} {name_str:<22} {ch['hits']:<6} {airtime_str:<9} {ch['last']:<12}"
 
                     if is_selected:
                         safe_addstr(stdscr, row_y, 2, line.ljust(w - 6), curses.color_pair(5))
@@ -524,7 +543,7 @@ def gui(stdscr, scanner):
                 else:
                     safe_addstr(stdscr, row_y, 2, " " * (w - 6))
 
-        # Bottom Footer Controls (Includes [C] Clear Hits)
+        # Bottom Footer Controls
         footer_y = max(11 + max_visible, h - 3)
         safe_addstr(stdscr, footer_y, 2, "─" * (w - 4), curses.color_pair(1))
         safe_addstr(stdscr, footer_y + 1, 2, " [A] Add  [C] Clr Hits  [R] Rec  [+/-] Squelch  [SPACE] Hold  [G] Gain  [Q] Quit ", curses.color_pair(1))
@@ -550,7 +569,7 @@ def gui(stdscr, scanner):
             if f_str:
                 try:
                     f_val = float(f_str)
-                    lbl_str = prompt_user_input(stdscr, "Enter Agency/Channel Name: ", prompt_y, 2, max_len=20)
+                    lbl_str = prompt_user_input(stdscr, "Enter Agency/Channel Name: ", prompt_y, 2, max_len=21)
                     if not lbl_str:
                         lbl_str = f"{f_val:.3f} MHz"
                     scanner.add_channel(f_val, lbl_str)
@@ -589,7 +608,6 @@ def gui(stdscr, scanner):
 
 
 def main():
-    # Request standard 90x28 terminal geometry on startup
     sys.stdout.write("\x1b[8;28;90t")
     sys.stdout.flush()
 
