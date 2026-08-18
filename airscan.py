@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""
+AirScan: SDR Airband Monitor & Scanner
+--------------------------------------
+A lightweight, terminal-based AM aviation scanner using RTL-SDR.
+Features include signal-level squelch, automated hit tracking, 
+and hardware-accelerated VOX MP3 recording.
+
+Dependencies: rtl-sdr, ffmpeg, python3-sounddevice, python3-numpy
+"""
+
 import curses
 import os
 import sys
@@ -8,132 +18,23 @@ import threading
 import subprocess
 import ctypes
 import ctypes.util
+import shutil
 import numpy as np
 import sounddevice as sd
 from datetime import datetime
 
 # -------------------------------------------------------------
-# BASE DIRECTORY & FILE PATHS (Resolves Symlinks)
+# CONFIGURATION & FILE PATHS
 # -------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
 CSV_FILE = os.path.join(BASE_DIR, "frequencies.csv")
 RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
-# -------------------------------------------------------------
-# DIRECT LIBRTLSDR CTYPES BINDING WITH EXPLICIT SIGNATURES
-# -------------------------------------------------------------
-lib_path = ctypes.util.find_library('rtlsdr')
-if not lib_path:
-    for candidate in [
-        '/lib/x86_64-linux-gnu/librtlsdr.so.0',
-        '/lib/x86_64-linux-gnu/librtlsdr.so',
-        '/usr/lib/x86_64-linux-gnu/librtlsdr.so',
-        'librtlsdr.so.0',
-        'librtlsdr.so'
-    ]:
-        if os.path.exists(candidate):
-            lib_path = candidate
-            break
+SAMPLE_RATE = 1024000
+AUDIO_RATE = 32000
+DECIMATION = int(SAMPLE_RATE / AUDIO_RATE)  # Yields 32
 
-try:
-    librtlsdr = ctypes.CDLL(lib_path)
-except Exception as e:
-    sys.exit(f"Error loading librtlsdr: {e}")
-
-librtlsdr.rtlsdr_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32]
-librtlsdr.rtlsdr_open.restype = ctypes.c_int
-
-librtlsdr.rtlsdr_close.argtypes = [ctypes.c_void_p]
-librtlsdr.rtlsdr_close.restype = ctypes.c_int
-
-librtlsdr.rtlsdr_set_center_freq.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-librtlsdr.rtlsdr_set_center_freq.restype = ctypes.c_int
-
-librtlsdr.rtlsdr_set_sample_rate.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-librtlsdr.rtlsdr_set_sample_rate.restype = ctypes.c_int
-
-librtlsdr.rtlsdr_set_tuner_gain_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
-librtlsdr.rtlsdr_set_tuner_gain_mode.restype = ctypes.c_int
-
-librtlsdr.rtlsdr_set_tuner_gain.argtypes = [ctypes.c_void_p, ctypes.c_int]
-librtlsdr.rtlsdr_set_tuner_gain.restype = ctypes.c_int
-
-librtlsdr.rtlsdr_get_tuner_gains.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
-librtlsdr.rtlsdr_get_tuner_gains.restype = ctypes.c_int
-
-librtlsdr.rtlsdr_reset_buffer.argtypes = [ctypes.c_void_p]
-librtlsdr.rtlsdr_reset_buffer.restype = ctypes.c_int
-
-librtlsdr.rtlsdr_read_sync.argtypes = [
-    ctypes.c_void_p,
-    ctypes.POINTER(ctypes.c_ubyte),
-    ctypes.c_int,
-    ctypes.POINTER(ctypes.c_int)
-]
-librtlsdr.rtlsdr_read_sync.restype = ctypes.c_int
-
-
-class NativeRtlSdr:
-    def __init__(self, device_index=0):
-        self.dev = ctypes.c_void_p()
-        if librtlsdr.rtlsdr_open(ctypes.byref(self.dev), device_index) < 0:
-            raise RuntimeError("Failed to open RTL-SDR. Unplug and replug the dongle.")
-        
-        num_gains = librtlsdr.rtlsdr_get_tuner_gains(self.dev, None)
-        if num_gains > 0:
-            gains_array = (ctypes.c_int * num_gains)()
-            librtlsdr.rtlsdr_get_tuner_gains(self.dev, gains_array)
-            self.valid_gains_db = [g / 10.0 for g in gains_array]
-        else:
-            self.valid_gains_db = [0.0, 9.0, 14.0, 20.7, 28.0, 38.0, 42.1, 49.6]
-
-        librtlsdr.rtlsdr_set_tuner_gain_mode(self.dev, 1)
-        self.gain = 38.0
-        self.set_gain(self.gain)
-
-    def set_sample_rate(self, rate):
-        if self.dev:
-            librtlsdr.rtlsdr_set_sample_rate(self.dev, int(rate))
-
-    def set_center_freq(self, freq_hz):
-        if self.dev:
-            librtlsdr.rtlsdr_set_center_freq(self.dev, int(freq_hz))
-
-    def set_gain(self, gain_db):
-        self.gain = float(gain_db)
-        if self.dev:
-            librtlsdr.rtlsdr_set_tuner_gain(self.dev, int(gain_db * 10))
-
-    def reset_buffer(self):
-        if self.dev:
-            librtlsdr.rtlsdr_reset_buffer(self.dev)
-
-    def read_samples(self, num_samples=16384):
-        if not self.dev:
-            return np.zeros(num_samples, dtype=np.complex64)
-        num_bytes = num_samples * 2
-        buf = (ctypes.c_ubyte * num_bytes)()
-        n_read = ctypes.c_int()
-        
-        result = librtlsdr.rtlsdr_read_sync(self.dev, buf, num_bytes, ctypes.byref(n_read))
-        if result < 0 or n_read.value < num_bytes:
-            return np.zeros(num_samples, dtype=np.complex64)
-            
-        raw = np.ctypeslib.as_array(buf)
-        iq = (raw.astype(np.float32) - 127.5) / 127.5
-        return iq[0::2] + 1j * iq[1::2]
-
-    def close(self):
-        if self.dev:
-            d = self.dev
-            self.dev = None
-            librtlsdr.rtlsdr_close(d)
-
-
-# -------------------------------------------------------------
-# FREQUENCY CSV & TIME MANAGEMENT
-# -------------------------------------------------------------
 DEFAULT_CHANNELS = [
     (123.025, "Helo Air-to-Air"),
     (123.050, "Heliport UNICOM"),
@@ -146,7 +47,117 @@ DEFAULT_CHANNELS = [
     (122.800, "UNICOM / Advisory")
 ]
 
+# -------------------------------------------------------------
+# NATIVE HARDWARE BINDINGS (librtlsdr)
+# -------------------------------------------------------------
+def load_rtlsdr():
+    """Locates and binds the native RTL-SDR C library."""
+    lib_path = ctypes.util.find_library('rtlsdr')
+    if not lib_path:
+        for candidate in [
+            '/lib/x86_64-linux-gnu/librtlsdr.so.0',
+            '/lib/x86_64-linux-gnu/librtlsdr.so',
+            '/usr/lib/x86_64-linux-gnu/librtlsdr.so',
+            'librtlsdr.so.0',
+            'librtlsdr.so'
+        ]:
+            if os.path.exists(candidate):
+                lib_path = candidate
+                break
+
+    if not lib_path:
+        raise RuntimeError("librtlsdr not found. Please install rtl-sdr packages.")
+
+    lib = ctypes.CDLL(lib_path)
+    
+    # Define explicit C function signatures for memory safety
+    lib.rtlsdr_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32]
+    lib.rtlsdr_open.restype = ctypes.c_int
+    lib.rtlsdr_close.argtypes = [ctypes.c_void_p]
+    lib.rtlsdr_close.restype = ctypes.c_int
+    lib.rtlsdr_set_center_freq.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    lib.rtlsdr_set_center_freq.restype = ctypes.c_int
+    lib.rtlsdr_set_sample_rate.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    lib.rtlsdr_set_sample_rate.restype = ctypes.c_int
+    lib.rtlsdr_set_tuner_gain_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.rtlsdr_set_tuner_gain_mode.restype = ctypes.c_int
+    lib.rtlsdr_set_tuner_gain.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.rtlsdr_set_tuner_gain.restype = ctypes.c_int
+    lib.rtlsdr_get_tuner_gains.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    lib.rtlsdr_get_tuner_gains.restype = ctypes.c_int
+    lib.rtlsdr_reset_buffer.argtypes = [ctypes.c_void_p]
+    lib.rtlsdr_reset_buffer.restype = ctypes.c_int
+    lib.rtlsdr_read_sync.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+    lib.rtlsdr_read_sync.restype = ctypes.c_int
+    
+    return lib
+
+class NativeRtlSdr:
+    """Hardware controller for the physical RTL-SDR USB dongle."""
+    def __init__(self, device_index=0):
+        self.lib = load_rtlsdr()
+        self.dev = ctypes.c_void_p()
+        
+        if self.lib.rtlsdr_open(ctypes.byref(self.dev), device_index) < 0:
+            raise RuntimeError("Failed to open RTL-SDR. Unplug and replug the USB dongle.")
+        
+        # Populate valid hardware gains
+        num_gains = self.lib.rtlsdr_get_tuner_gains(self.dev, None)
+        if num_gains > 0:
+            gains_array = (ctypes.c_int * num_gains)()
+            self.lib.rtlsdr_get_tuner_gains(self.dev, gains_array)
+            self.valid_gains_db = [g / 10.0 for g in gains_array]
+        else:
+            self.valid_gains_db = [0.0, 9.0, 14.0, 20.7, 28.0, 38.0, 42.1, 49.6]
+
+        self.lib.rtlsdr_set_tuner_gain_mode(self.dev, 1)
+        self.gain = 38.0
+        self.set_gain(self.gain)
+
+    def set_sample_rate(self, rate):
+        if self.dev:
+            self.lib.rtlsdr_set_sample_rate(self.dev, int(rate))
+
+    def set_center_freq(self, freq_hz):
+        if self.dev:
+            self.lib.rtlsdr_set_center_freq(self.dev, int(freq_hz))
+
+    def set_gain(self, gain_db):
+        self.gain = float(gain_db)
+        if self.dev:
+            self.lib.rtlsdr_set_tuner_gain(self.dev, int(gain_db * 10))
+
+    def reset_buffer(self):
+        if self.dev:
+            self.lib.rtlsdr_reset_buffer(self.dev)
+
+    def read_samples(self, num_samples=16384):
+        if not self.dev:
+            return np.zeros(num_samples, dtype=np.complex64)
+            
+        num_bytes = num_samples * 2
+        buf = (ctypes.c_ubyte * num_bytes)()
+        n_read = ctypes.c_int()
+        
+        result = self.lib.rtlsdr_read_sync(self.dev, buf, num_bytes, ctypes.byref(n_read))
+        if result < 0 or n_read.value < num_bytes:
+            return np.zeros(num_samples, dtype=np.complex64)
+            
+        raw = np.ctypeslib.as_array(buf)
+        iq = (raw.astype(np.float32) - 127.5) / 127.5
+        return iq[0::2] + 1j * iq[1::2]
+
+    def close(self):
+        if self.dev:
+            d = self.dev
+            self.dev = None
+            self.lib.rtlsdr_close(d)
+
+# -------------------------------------------------------------
+# CORE SCANNING ENGINE
+# -------------------------------------------------------------
 def format_airtime(seconds):
+    """Formats cumulative transmission time into human-readable strings."""
     if seconds <= 0:
         return "00:00"
     s = int(seconds)
@@ -159,57 +170,72 @@ def format_airtime(seconds):
     return f"{mins:02d}:{secs:02d}"
 
 def load_channels():
+    """Loads scan lists from disk or initializes defaults safely."""
     channels = []
     if not os.path.exists(CSV_FILE):
-        with open(CSV_FILE, mode='w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            for freq, name in DEFAULT_CHANNELS:
-                writer.writerow([f"{freq:.3f}", name])
+        try:
+            with open(CSV_FILE, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                for freq, name in DEFAULT_CHANNELS:
+                    writer.writerow([f"{freq:.3f}", name])
+        except Exception:
+            pass # Failsafe if directory lacks write permissions
 
-    with open(CSV_FILE, mode='r', encoding='utf-8') as f:
-        reader = csv.reader(f)
-        for row in reader:
-            if not row or row[0].startswith('#'):
-                continue
-            try:
-                freq = float(row[0].strip())
-                name = row[1].strip() if len(row) > 1 else f"Ch {len(channels)+1}"
-                channels.append({"freq": freq, "name": name, "hits": 0, "active_sec": 0.0, "last": "0"})
-            except ValueError:
-                continue
+    try:
+        with open(CSV_FILE, mode='r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if not row or row[0].startswith('#'):
+                    continue
+                try:
+                    freq = float(row[0].strip())
+                    name = row[1].strip() if len(row) > 1 else f"Ch {len(channels)+1}"
+                    channels.append({"freq": freq, "name": name, "hits": 0, "active_sec": 0.0, "last": "0"})
+                except ValueError:
+                    continue
+    except Exception:
+        pass
 
     return channels if channels else [{"freq": 122.800, "name": "UNICOM", "hits": 0, "active_sec": 0.0, "last": "0"}]
 
 def append_channel_to_csv(freq, name):
-    with open(CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow([f"{freq:.3f}", name])
-
-
-SAMPLE_RATE = 1024000
-AUDIO_RATE = 32000
-DECIMATION = int(SAMPLE_RATE / AUDIO_RATE)  # 32
+    try:
+        with open(CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([f"{freq:.3f}", name])
+    except Exception:
+        pass
 
 class AirbandScanner:
+    """Manages DSP, scanning state, and audio routing."""
     def __init__(self):
         self.channels = load_channels()
-        self.sdr = NativeRtlSdr()
+        
+        try:
+            self.sdr = NativeRtlSdr()
+        except RuntimeError as e:
+            # Gracefully handle missing hardware so curses can print the error
+            self.sdr = None
+            self.init_error = str(e)
+            return
+            
+        self.init_error = None
         self.sdr.set_sample_rate(SAMPLE_RATE)
         
         self.squelch = -28.0
         self.volume = 1.0
         self.running = True
         self.held = False
-        
         self.agc_peak = 0.05
         
-        # Recording state & timing
         self.recording = False
         self.vox_active = False
         self.ffmpeg_proc = None
         self.rec_filename = ""
         self.rec_start_time = 0.0
         self.total_vox_samples = 0
+        self.ffmpeg_available = bool(shutil.which("ffmpeg"))
+        
         self.rec_lock = threading.Lock()
         self.channel_lock = threading.Lock()
         
@@ -218,17 +244,16 @@ class AirbandScanner:
         self.current_rssi = -100.0
         self.status = "SCANNING"
         
-        self.stream = sd.OutputStream(
-            samplerate=AUDIO_RATE,
-            channels=1,
-            dtype='float32',
-            blocksize=1024
-        )
-        self.stream.start()
+        # Audio Initialization Failsafe
+        try:
+            self.stream = sd.OutputStream(samplerate=AUDIO_RATE, channels=1, dtype='float32', blocksize=1024)
+            self.stream.start()
+        except Exception:
+            self.stream = None # Headless/No-Audio fallback
 
     def set_frequency(self, freq_mhz):
         hz = int(float(freq_mhz) * 1e6)
-        if 24000000 <= hz <= 1766000000:
+        if 24000000 <= hz <= 1766000000 and self.sdr:
             self.sdr.set_center_freq(hz)
 
     def calculate_rssi(self, samples):
@@ -236,10 +261,11 @@ class AirbandScanner:
         return float(10 * np.log10(p + 1e-12))
 
     def demodulate_am(self, samples):
+        """Demodulates complex IQ to AM audio using envelope detection."""
         mag = np.abs(samples)
         n_blocks = len(mag) // DECIMATION
         audio = mag[:n_blocks * DECIMATION].reshape(n_blocks, DECIMATION).mean(axis=1)
-        audio = audio - np.mean(audio)
+        audio = audio - np.mean(audio) # Remove DC offset
         
         chunk_peak = float(np.max(np.abs(audio))) if len(audio) > 0 else 0.01
         self.agc_peak = max(chunk_peak, (self.agc_peak * 0.96) + (chunk_peak * 0.04))
@@ -247,6 +273,7 @@ class AirbandScanner:
         target_gain = 0.85 / max(self.agc_peak, 0.01)
         target_gain = min(target_gain, 12.0)
         audio = audio * target_gain
+        
         return np.clip(audio, -1.0, 1.0).astype(np.float32)
 
     def add_channel(self, freq, name):
@@ -262,6 +289,9 @@ class AirbandScanner:
                 ch["last"] = "0"
 
     def toggle_record(self):
+        if not self.ffmpeg_available:
+            return
+
         with self.rec_lock:
             self.recording = not self.recording
             if self.recording:
@@ -271,29 +301,35 @@ class AirbandScanner:
                 self.rec_start_time = time.time()
                 
                 cmd = [
-                    'ffmpeg', '-y',
-                    '-f', 's16le',
-                    '-ar', str(AUDIO_RATE),
-                    '-ac', '1',
-                    '-i', '-',
-                    '-codec:a', 'libmp3lame',
-                    '-b:a', '64k',
-                    self.rec_filename
+                    'ffmpeg', '-y', '-f', 's16le', '-ar', str(AUDIO_RATE),
+                    '-ac', '1', '-i', '-', '-codec:a', 'libmp3lame',
+                    '-b:a', '64k', self.rec_filename
                 ]
-                self.ffmpeg_proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-            else:
-                if self.ffmpeg_proc:
-                    try:
-                        self.ffmpeg_proc.stdin.close()
-                        self.ffmpeg_proc.wait(timeout=1.5)
-                    except Exception:
-                        self.ffmpeg_proc.kill()
+                try:
+                    self.ffmpeg_proc = subprocess.Popen(
+                        cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                except Exception:
+                    self.recording = False
                     self.ffmpeg_proc = None
+            else:
+                self._stop_ffmpeg()
+
+    def _stop_ffmpeg(self):
+        """Internal helper to securely shut down the recording stream and prune empty files."""
+        if self.ffmpeg_proc:
+            try:
+                self.ffmpeg_proc.stdin.close()
+                self.ffmpeg_proc.wait(timeout=1.5)
+            except Exception:
+                try: self.ffmpeg_proc.kill()
+                except Exception: pass
+            self.ffmpeg_proc = None
+            
+        # Anti-Clutter: Prune files smaller than 10KB (junk/empty streams)
+        if os.path.exists(self.rec_filename) and os.path.getsize(self.rec_filename) < 10000:
+            try: os.remove(self.rec_filename)
+            except Exception: pass
 
     def get_duration_str(self):
         if not self.recording:
@@ -304,6 +340,8 @@ class AirbandScanner:
         return f"{v_mins:02d}:{v_secs:02d}"
 
     def worker_loop(self):
+        if not self.sdr: return
+        
         chunk_time = 16384 / SAMPLE_RATE
         while self.running:
             with self.channel_lock:
@@ -316,7 +354,7 @@ class AirbandScanner:
 
             self.sdr.reset_buffer()
             self.set_frequency(freq)
-            time.sleep(0.015)
+            time.sleep(0.015) # Wait for hardware PLL to lock
 
             samples = self.sdr.read_samples(16384)
             self.current_rssi = self.calculate_rssi(samples)
@@ -342,12 +380,16 @@ class AirbandScanner:
                             ch["active_sec"] += chunk_time
 
                     audio = self.demodulate_am(samples)
-                    play_audio = np.clip(audio * self.volume, -1.0, 1.0)
-                    try:
-                        self.stream.write(play_audio)
-                    except Exception:
-                        pass
+                    
+                    # Route audio to local speakers if successfully initialized
+                    if self.stream:
+                        play_audio = np.clip(audio * self.volume, -1.0, 1.0)
+                        try:
+                            self.stream.write(play_audio)
+                        except Exception:
+                            pass
 
+                    # Route audio to background recording stream
                     if self.recording and self.vox_active:
                         with self.rec_lock:
                             if self.ffmpeg_proc and self.ffmpeg_proc.stdin:
@@ -369,33 +411,36 @@ class AirbandScanner:
     def close(self):
         self.running = False
         with self.rec_lock:
-            if self.ffmpeg_proc:
-                try:
-                    self.ffmpeg_proc.stdin.close()
-                    self.ffmpeg_proc.wait(timeout=1.0)
-                except Exception:
-                    self.ffmpeg_proc.kill()
-                self.ffmpeg_proc = None
-        try:
-            self.stream.stop()
-            self.stream.close()
-        except Exception:
-            pass
-        self.sdr.close()
+            self._stop_ffmpeg()
+            
+        if self.stream:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:
+                pass
+                
+        if self.sdr:
+            self.sdr.close()
 
-
+# -------------------------------------------------------------
+# CURSES TERMINAL INTERFACE
+# -------------------------------------------------------------
 def draw_meter(rssi, squelch, width=18):
-    norm_val = int(np.clip((rssi + 60) / 60 * width, 0, width))
-    norm_sq = int(np.clip((squelch + 60) / 60 * width, 0, width))
+    """Renders the graphical S-Meter safely within array boundaries."""
+    norm_val = int(np.clip((rssi + 80) / 60 * width, 0, width))
+    norm_sq = int(np.clip((squelch + 80) / 60 * width, 0, width))
     bar = list(" " * width)
+    
     for i in range(norm_val):
         bar[i] = "■"
     if 0 <= norm_sq < width:
         bar[norm_sq] = "│"
+        
     return "".join(bar)
 
-
 def safe_addstr(stdscr, y, x, text, attr=0):
+    """Failsafe to prevent UI crashes if string exceeds terminal dimensions."""
     h, w = stdscr.getmaxyx()
     if 0 <= y < h and 0 <= x < w:
         try:
@@ -403,8 +448,8 @@ def safe_addstr(stdscr, y, x, text, attr=0):
         except curses.error:
             pass
 
-
 def prompt_user_input(stdscr, prompt_text, y, x, max_len=22):
+    """Generates an inline prompt for adding frequencies on the fly."""
     curses.echo()
     curses.curs_set(1)
     stdscr.nodelay(False)
@@ -419,7 +464,6 @@ def prompt_user_input(stdscr, prompt_text, y, x, max_len=22):
     stdscr.nodelay(False)
     stdscr.timeout(60)
     return val
-
 
 def gui(stdscr, scanner):
     curses.curs_set(0)
@@ -438,11 +482,23 @@ def gui(stdscr, scanner):
     MIN_LINES = 14
     MIN_COLS = 75
 
+    # Hardware Failsafe Display
+    if scanner.init_error:
+        stdscr.erase()
+        safe_addstr(stdscr, 2, 2, "HARDWARE INITIALIZATION ERROR", curses.color_pair(3) | curses.A_BOLD)
+        safe_addstr(stdscr, 4, 2, scanner.init_error)
+        safe_addstr(stdscr, 6, 2, "Press any key to exit.")
+        stdscr.refresh()
+        stdscr.nodelay(False)
+        stdscr.getch()
+        return
+
     while scanner.running:
         max_y, max_x = stdscr.getmaxyx()
         with scanner.channel_lock:
             num_channels = len(scanner.channels)
 
+        # Dynamic Resize Shielding
         if max_y < MIN_LINES or max_x < MIN_COLS:
             stdscr.erase()
             w_title = "! TERMINAL WINDOW TOO SMALL !"
@@ -471,7 +527,7 @@ def gui(stdscr, scanner):
         stdscr.erase()
         h, w = max_y, max_x
 
-        # Header Box
+        # Header Definition
         safe_addstr(stdscr, 1, 2, "┌" + "─" * (w - 6) + "┐", curses.color_pair(1) | curses.A_BOLD)
         safe_addstr(stdscr, 2, 2, ("│  AIRSCAN - SDR AIRBAND MONITOR & SCANNER").ljust(w - 5) + "│", curses.color_pair(1) | curses.A_BOLD)
         safe_addstr(stdscr, 3, 2, "└" + "─" * (w - 6) + "┘", curses.color_pair(1) | curses.A_BOLD)
@@ -485,9 +541,11 @@ def gui(stdscr, scanner):
         else:
             safe_addstr(stdscr, 4, 12, "[ SCANNING ]", curses.color_pair(2))
 
-        # VOX Recording & Duration
+        # VOX Recording Control
         safe_addstr(stdscr, 4, 28, "MP3 VOX REC: ")
-        if scanner.recording:
+        if not scanner.ffmpeg_available:
+            safe_addstr(stdscr, 4, 41, "FFMPEG MISSING", curses.color_pair(3))
+        elif scanner.recording:
             if scanner.vox_active:
                 safe_addstr(stdscr, 4, 41, "● CAPTURING", curses.color_pair(3) | curses.A_BOLD)
             else:
@@ -498,7 +556,7 @@ def gui(stdscr, scanner):
         dur_str = scanner.get_duration_str()
         safe_addstr(stdscr, 4, 55, f"AUDIO: [{dur_str}]", curses.A_BOLD if scanner.recording else curses.A_DIM)
 
-        # Telemetry & S-Meter
+        # Telemetry Definition
         meter_str = draw_meter(scanner.current_rssi, scanner.squelch, width=18)
         safe_addstr(stdscr, 5, 4, f"SIGNAL: [{meter_str}] {scanner.current_rssi:5.1f} dBFS")
         safe_addstr(stdscr, 5, 48, f"SQUELCH: {scanner.squelch:5.1f} dBFS")
@@ -510,7 +568,7 @@ def gui(stdscr, scanner):
         else:
             safe_addstr(stdscr, 6, 32, " " * (w - 34))
 
-        # Channel Table Header (Aligned layout with guaranteed width boundaries)
+        # Channel Hit Tracker UI
         header_text = f"  {'CH':<4} {'FREQ (MHz)':<12} {'CHANNEL / AGENCY':<22} {'HITS':<6} {'AIRTIME':<9} {'LAST HEARD':<12}"
         safe_addstr(stdscr, 8, 2, header_text, curses.color_pair(1) | curses.A_BOLD)
         safe_addstr(stdscr, 9, 2, "─" * (w - 4), curses.color_pair(1))
@@ -529,7 +587,7 @@ def gui(stdscr, scanner):
 
                     prefix = "► " if is_active else "  "
                     airtime_str = format_airtime(ch.get("active_sec", 0.0))
-                    name_str = ch['name'][:21]  # Strict clip prevents pushing subsequent columns
+                    name_str = ch['name'][:21]
                     
                     line = f"{prefix}{i+1:<4} {ch['freq']:<12.3f} {name_str:<22} {ch['hits']:<6} {airtime_str:<9} {ch['last']:<12}"
 
@@ -543,11 +601,12 @@ def gui(stdscr, scanner):
                 else:
                     safe_addstr(stdscr, row_y, 2, " " * (w - 6))
 
-        # Bottom Footer Controls
+        # Bottom Footer Shortcuts
         footer_y = max(11 + max_visible, h - 3)
         safe_addstr(stdscr, footer_y, 2, "─" * (w - 4), curses.color_pair(1))
         safe_addstr(stdscr, footer_y + 1, 2, " [A] Add  [C] Clr Hits  [R] Rec  [+/-] Squelch  [SPACE] Hold  [G] Gain  [Q] Quit ", curses.color_pair(1))
 
+        # Input Parsing
         try:
             key = stdscr.getch()
             if key == curses.KEY_RESIZE:
@@ -595,10 +654,11 @@ def gui(stdscr, scanner):
             scanner.current_idx = scanner.selected_row
             scanner.held = True
         elif key in [ord('g'), ord('G')]:
-            gains = scanner.sdr.valid_gains_db
-            curr = scanner.sdr.gain
-            next_gains = [g for g in gains if g > curr]
-            scanner.sdr.set_gain(next_gains[0] if next_gains else gains[0])
+            if hasattr(scanner.sdr, 'valid_gains_db'):
+                gains = scanner.sdr.valid_gains_db
+                curr = scanner.sdr.gain
+                next_gains = [g for g in gains if g > curr]
+                scanner.sdr.set_gain(next_gains[0] if next_gains else gains[0])
         elif key == ord(']'):
             scanner.volume = min(3.0, scanner.volume + 0.1)
         elif key == ord('['):
@@ -606,12 +666,16 @@ def gui(stdscr, scanner):
 
         stdscr.refresh()
 
-
 def main():
+    """Entry point for terminal window management and thread instantiation."""
     sys.stdout.write("\x1b[8;28;90t")
     sys.stdout.flush()
 
     scanner = AirbandScanner()
+    if scanner.init_error:
+        print(f"Error: {scanner.init_error}")
+        return
+
     worker = threading.Thread(target=scanner.worker_loop, daemon=True)
     worker.start()
 
