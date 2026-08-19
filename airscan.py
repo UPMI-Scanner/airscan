@@ -100,7 +100,7 @@ class VoiceBandpassFilter:
         return lp_out
 
 # -------------------------------------------------------------
-# NATIVE HARDWARE BINDINGS (librtlsdr)
+# NATIVE HARDWARE BINDINGS (librtlsdr) WITH THREAD-SAFE LOCKING
 # -------------------------------------------------------------
 def load_rtlsdr():
     lib_path = ctypes.util.find_library('rtlsdr')
@@ -149,66 +149,75 @@ def load_rtlsdr():
     return lib
 
 class NativeRtlSdr:
+    """Thread-safe hardware controller for physical RTL-SDR USB dongles."""
     def __init__(self, device_index=0, ppm=0, initial_gain=38.0):
         self.lib = load_rtlsdr()
         self.dev = ctypes.c_void_p()
+        self.lock = threading.Lock()
         
-        if self.lib.rtlsdr_open(ctypes.byref(self.dev), device_index) < 0:
-            raise RuntimeError(f"Failed to open RTL-SDR (device index {device_index}). Unplug and replug the dongle.")
-        
-        if ppm != 0:
-            self.lib.rtlsdr_set_freq_correction(self.dev, int(ppm))
+        with self.lock:
+            if self.lib.rtlsdr_open(ctypes.byref(self.dev), device_index) < 0:
+                raise RuntimeError(f"Failed to open RTL-SDR (device index {device_index}). Unplug and replug the dongle.")
+            
+            if ppm != 0:
+                self.lib.rtlsdr_set_freq_correction(self.dev, int(ppm))
 
-        num_gains = self.lib.rtlsdr_get_tuner_gains(self.dev, None)
-        if num_gains > 0:
-            gains_array = (ctypes.c_int * num_gains)()
-            self.lib.rtlsdr_get_tuner_gains(self.dev, gains_array)
-            self.valid_gains_db = [g / 10.0 for g in gains_array]
-        else:
-            self.valid_gains_db = [0.0, 9.0, 14.0, 20.7, 28.0, 38.0, 42.1, 49.6]
+            num_gains = self.lib.rtlsdr_get_tuner_gains(self.dev, None)
+            if num_gains > 0:
+                gains_array = (ctypes.c_int * num_gains)()
+                self.lib.rtlsdr_get_tuner_gains(self.dev, gains_array)
+                self.valid_gains_db = [g / 10.0 for g in gains_array]
+            else:
+                self.valid_gains_db = [0.0, 9.0, 14.0, 20.7, 28.0, 38.0, 42.1, 49.6]
 
-        self.lib.rtlsdr_set_tuner_gain_mode(self.dev, 1)
-        self.gain = float(initial_gain)
-        self.set_gain(self.gain)
+            self.lib.rtlsdr_set_tuner_gain_mode(self.dev, 1)
+            self.gain = float(initial_gain)
+            self.lib.rtlsdr_set_tuner_gain(self.dev, int(self.gain * 10))
 
     def set_sample_rate(self, rate):
-        if self.dev:
-            self.lib.rtlsdr_set_sample_rate(self.dev, int(rate))
+        with self.lock:
+            if self.dev:
+                self.lib.rtlsdr_set_sample_rate(self.dev, int(rate))
 
     def set_center_freq(self, freq_hz):
-        if self.dev:
-            self.lib.rtlsdr_set_center_freq(self.dev, int(freq_hz))
+        with self.lock:
+            if self.dev:
+                self.lib.rtlsdr_set_center_freq(self.dev, int(freq_hz))
 
     def set_gain(self, gain_db):
-        self.gain = float(gain_db)
-        if self.dev:
-            self.lib.rtlsdr_set_tuner_gain(self.dev, int(gain_db * 10))
+        with self.lock:
+            self.gain = float(gain_db)
+            if self.dev:
+                self.lib.rtlsdr_set_tuner_gain(self.dev, int(gain_db * 10))
 
     def reset_buffer(self):
-        if self.dev:
-            self.lib.rtlsdr_reset_buffer(self.dev)
+        with self.lock:
+            if self.dev:
+                self.lib.rtlsdr_reset_buffer(self.dev)
 
     def read_samples(self, num_samples=SDR_CHUNK_SAMPLES):
-        if not self.dev:
-            return np.zeros(num_samples, dtype=np.complex64)
+        with self.lock:
+            if not self.dev:
+                return np.zeros(num_samples, dtype=np.complex64)
+                
+            num_bytes = num_samples * 2
+            buf = (ctypes.c_ubyte * num_bytes)()
+            n_read = ctypes.c_int()
             
-        num_bytes = num_samples * 2
-        buf = (ctypes.c_ubyte * num_bytes)()
-        n_read = ctypes.c_int()
-        
-        result = self.lib.rtlsdr_read_sync(self.dev, buf, num_bytes, ctypes.byref(n_read))
-        if result < 0 or n_read.value < num_bytes:
-            return np.zeros(num_samples, dtype=np.complex64)
-            
-        raw = np.ctypeslib.as_array(buf)
-        iq = (raw.astype(np.float32) - 127.5) / 127.5
-        return iq[0::2] + 1j * iq[1::2]
+            result = self.lib.rtlsdr_read_sync(self.dev, buf, num_bytes, ctypes.byref(n_read))
+            if result < 0 or n_read.value < num_bytes:
+                return np.zeros(num_samples, dtype=np.complex64)
+                
+            raw = np.ctypeslib.as_array(buf)
+            iq = (raw.astype(np.float32) - 127.5) / 127.5
+            return iq[0::2] + 1j * iq[1::2]
 
     def close(self):
-        if self.dev:
-            d = self.dev
-            self.dev = None
-            self.lib.rtlsdr_close(d)
+        with self.lock:
+            if self.dev:
+                d = self.dev
+                self.dev = None
+                self.lib.rtlsdr_close(d)
 
 # -------------------------------------------------------------
 # FREQUENCY & AIRTIME MANAGEMENT
@@ -289,10 +298,8 @@ class AirbandScanner:
         self.held = False
         self.agc_peak = 0.05
         
-        # Audio Ring Buffer Queue
         self.audio_queue = queue.Queue(maxsize=16)
         
-        # Recording state & locks
         self.recording = False
         self.vox_active = False
         self.ffmpeg_proc = None
@@ -308,7 +315,6 @@ class AirbandScanner:
         self.current_rssi = -100.0
         self.status = "SCANNING"
         
-        # Output Audio Callback Stream
         self.stream = None
         if not self.no_audio:
             try:
