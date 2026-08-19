@@ -3,7 +3,7 @@
 AirScan: Professional SDR Airband Monitor & Scanner
 ---------------------------------------------------
 A lightweight, terminal-based AM aviation scanner using RTL-SDR.
-Features signal-level squelch, IIR voice filtering, decoupled audio queues,
+Features signal-level squelch, IIR voice filtering, circular audio ring buffers,
 and hardware-assisted VOX MP3 recording.
 """
 
@@ -13,7 +13,6 @@ import os
 import sys
 import time
 import csv
-import queue
 import threading
 import subprocess
 import ctypes
@@ -36,6 +35,7 @@ AUDIO_RATE = 32000
 DECIMATION = int(SAMPLE_RATE / AUDIO_RATE)  # 32
 SDR_CHUNK_SAMPLES = 16384
 AUDIO_CHUNK_SAMPLES = SDR_CHUNK_SAMPLES // DECIMATION  # 512
+HANG_CHUNKS = 22  # ~350ms hang time for natural voice pauses
 
 DEFAULT_CHANNELS = [
     (123.025, "Helo Air-to-Air"),
@@ -50,6 +50,70 @@ DEFAULT_CHANNELS = [
 ]
 
 # -------------------------------------------------------------
+# THREAD-SAFE AUDIO RING BUFFER (Continuous Stream)
+# -------------------------------------------------------------
+class AudioRingBuffer:
+    """
+    Continuous circular audio buffer. Seamlessly handles any arbitrary 
+    frame size requested by ALSA / PulseAudio / PipeWire without dropping
+    or zero-padding samples.
+    """
+    def __init__(self, capacity=48000):
+        self.capacity = capacity
+        self.buffer = np.zeros(capacity, dtype=np.float32)
+        self.write_pos = 0
+        self.read_pos = 0
+        self.available = 0
+        self.lock = threading.Lock()
+
+    def write(self, data: np.ndarray):
+        with self.lock:
+            n = len(data)
+            if n > self.capacity:
+                data = data[-self.capacity:]
+                n = len(data)
+
+            if self.available + n > self.capacity:
+                drop = (self.available + n) - self.capacity
+                self.read_pos = (self.read_pos + drop) % self.capacity
+                self.available -= drop
+
+            first_chunk = min(n, self.capacity - self.write_pos)
+            self.buffer[self.write_pos:self.write_pos + first_chunk] = data[:first_chunk]
+            if n > first_chunk:
+                second_chunk = n - first_chunk
+                self.buffer[0:second_chunk] = data[first_chunk:]
+
+            self.write_pos = (self.write_pos + n) % self.capacity
+            self.available += n
+
+    def read(self, out: np.ndarray, frames: int):
+        with self.lock:
+            if self.available == 0:
+                out.fill(0.0)
+                return
+
+            n = min(frames, self.available)
+            first_chunk = min(n, self.capacity - self.read_pos)
+            out[:first_chunk, 0] = self.buffer[self.read_pos:self.read_pos + first_chunk]
+            if n > first_chunk:
+                second_chunk = n - first_chunk
+                out[first_chunk:first_chunk + second_chunk, 0] = self.buffer[0:second_chunk]
+
+            if n < frames:
+                out[n:, 0] = 0.0
+
+            self.read_pos = (self.read_pos + n) % self.capacity
+            self.available -= n
+
+    def clear(self):
+        with self.lock:
+            self.write_pos = 0
+            self.read_pos = 0
+            self.available = 0
+            self.buffer.fill(0.0)
+
+# -------------------------------------------------------------
 # IIR 300 Hz - 3500 Hz VOICE BANDPASS FILTER
 # -------------------------------------------------------------
 class VoiceBandpassFilter:
@@ -58,20 +122,19 @@ class VoiceBandpassFilter:
     Attenuates low-end hum (<300 Hz) and AM carrier hiss (>3500 Hz) at 32 kHz.
     """
     def __init__(self):
-        # 300 Hz High-Pass Filter Coefficients (Fs = 32 kHz, Q = 0.707)
         self.b_hp = np.array([0.959203, -1.918406, 0.959203], dtype=np.float32)
         self.a_hp = np.array([1.0, -1.916742, 0.920071], dtype=np.float32)
-        self.hp_z1 = 0.0
-        self.hp_z2 = 0.0
-
-        # 3500 Hz Low-Pass Filter Coefficients (Fs = 32 kHz, Q = 0.707)
         self.b_lp = np.array([0.078356, 0.156712, 0.078356], dtype=np.float32)
         self.a_lp = np.array([1.0, -1.067214, 0.380638], dtype=np.float32)
+        self.reset()
+
+    def reset(self):
+        self.hp_z1 = 0.0
+        self.hp_z2 = 0.0
         self.lp_z1 = 0.0
         self.lp_z2 = 0.0
 
     def process(self, x: np.ndarray) -> np.ndarray:
-        # High-Pass stage
         hp_out = np.empty_like(x)
         b0, b1, b2 = self.b_hp
         a1, a2 = self.a_hp[1], self.a_hp[2]
@@ -84,7 +147,6 @@ class VoiceBandpassFilter:
             hp_out[i] = yi
         self.hp_z1, self.hp_z2 = z1, z2
 
-        # Low-Pass stage
         lp_out = np.empty_like(hp_out)
         b0, b1, b2 = self.b_lp
         a1, a2 = self.a_lp[1], self.a_lp[2]
@@ -100,7 +162,7 @@ class VoiceBandpassFilter:
         return lp_out
 
 # -------------------------------------------------------------
-# NATIVE HARDWARE BINDINGS (librtlsdr) WITH THREAD-SAFE LOCKING
+# NATIVE HARDWARE BINDINGS (librtlsdr) WITH MUTEX & STATIC BUFFERS
 # -------------------------------------------------------------
 def load_rtlsdr():
     lib_path = ctypes.util.find_library('rtlsdr')
@@ -149,11 +211,16 @@ def load_rtlsdr():
     return lib
 
 class NativeRtlSdr:
-    """Thread-safe hardware controller for physical RTL-SDR USB dongles."""
     def __init__(self, device_index=0, ppm=0, initial_gain=38.0):
         self.lib = load_rtlsdr()
         self.dev = ctypes.c_void_p()
         self.lock = threading.Lock()
+        
+        # Pre-allocated reusable C buffer to eliminate heap GC thrash
+        self.num_samples = SDR_CHUNK_SAMPLES
+        self.num_bytes = self.num_samples * 2
+        self._buf = (ctypes.c_ubyte * self.num_bytes)()
+        self._n_read = ctypes.c_int()
         
         with self.lock:
             if self.lib.rtlsdr_open(ctypes.byref(self.dev), device_index) < 0:
@@ -200,15 +267,11 @@ class NativeRtlSdr:
             if not self.dev:
                 return np.zeros(num_samples, dtype=np.complex64)
                 
-            num_bytes = num_samples * 2
-            buf = (ctypes.c_ubyte * num_bytes)()
-            n_read = ctypes.c_int()
-            
-            result = self.lib.rtlsdr_read_sync(self.dev, buf, num_bytes, ctypes.byref(n_read))
-            if result < 0 or n_read.value < num_bytes:
+            result = self.lib.rtlsdr_read_sync(self.dev, self._buf, self.num_bytes, ctypes.byref(self._n_read))
+            if result < 0 or self._n_read.value < self.num_bytes:
                 return np.zeros(num_samples, dtype=np.complex64)
                 
-            raw = np.ctypeslib.as_array(buf)
+            raw = np.ctypeslib.as_array(self._buf)
             iq = (raw.astype(np.float32) - 127.5) / 127.5
             return iq[0::2] + 1j * iq[1::2]
 
@@ -298,7 +361,7 @@ class AirbandScanner:
         self.held = False
         self.agc_peak = 0.05
         
-        self.audio_queue = queue.Queue(maxsize=16)
+        self.ring_buffer = AudioRingBuffer(capacity=48000)
         
         self.recording = False
         self.vox_active = False
@@ -319,21 +382,12 @@ class AirbandScanner:
         if not self.no_audio:
             try:
                 def audio_callback(outdata, frames, time_info, status):
-                    try:
-                        data = self.audio_queue.get_nowait()
-                        if len(data) < frames:
-                            outdata[:len(data), 0] = data
-                            outdata[len(data):, 0] = 0.0
-                        else:
-                            outdata[:, 0] = data[:frames]
-                    except queue.Empty:
-                        outdata.fill(0.0)
+                    self.ring_buffer.read(outdata, frames)
 
                 self.stream = sd.OutputStream(
                     samplerate=AUDIO_RATE,
                     channels=1,
                     dtype='float32',
-                    blocksize=AUDIO_CHUNK_SAMPLES,
                     callback=audio_callback
                 )
                 self.stream.start()
@@ -344,6 +398,7 @@ class AirbandScanner:
         hz = int(float(freq_mhz) * 1e6)
         if 24000000 <= hz <= 1766000000 and self.sdr:
             self.sdr.set_center_freq(hz)
+            self.voice_filter.reset()
 
     def calculate_rssi(self, samples):
         p = np.mean(np.abs(samples)**2)
@@ -433,7 +488,8 @@ class AirbandScanner:
                     time.sleep(0.05)
                     continue
                 self.current_idx = self.current_idx % len(self.channels)
-                ch = self.channels[self.current_idx]
+                tuned_idx = self.current_idx
+                ch = self.channels[tuned_idx]
                 freq = ch["freq"]
 
             self.sdr.reset_buffer()
@@ -450,7 +506,12 @@ class AirbandScanner:
                     ch["last"] = datetime.now().strftime("%I:%M:%S %p")
 
                 hang_counter = 0
-                while self.running and (self.held or hang_counter < 6):
+                while self.running and (self.held or hang_counter < HANG_CHUNKS):
+                    # Retune Trap Fix: break immediately if user jumps channels during active hold
+                    with self.channel_lock:
+                        if self.current_idx != tuned_idx:
+                            break
+
                     samples = self.sdr.read_samples(SDR_CHUNK_SAMPLES)
                     self.current_rssi = self.calculate_rssi(samples)
                     
@@ -468,10 +529,7 @@ class AirbandScanner:
                     
                     if self.stream and not self.no_audio:
                         play_chunk = np.clip(filtered_audio * self.volume, -1.0, 1.0)
-                        try:
-                            self.audio_queue.put_nowait(play_chunk)
-                        except queue.Full:
-                            pass
+                        self.ring_buffer.write(play_chunk)
 
                     if self.recording and self.vox_active:
                         with self.rec_lock:
@@ -527,12 +585,12 @@ def safe_addstr(stdscr, y, x, text, attr=0):
         except curses.error:
             pass
 
-def prompt_user_input(stdscr, prompt_text, y, x, max_len=22):
+def prompt_user_input(stdscr, prompt_text, y, x, max_len=22, c_attr=0):
     curses.echo()
     curses.curs_set(1)
     stdscr.nodelay(False)
-    safe_addstr(stdscr, y, x, prompt_text + " " * (max_len + 5), curses.color_pair(4) | curses.A_BOLD)
-    safe_addstr(stdscr, y, x, prompt_text, curses.color_pair(4) | curses.A_BOLD)
+    safe_addstr(stdscr, y, x, prompt_text + " " * (max_len + 5), c_attr | curses.A_BOLD)
+    safe_addstr(stdscr, y, x, prompt_text, c_attr | curses.A_BOLD)
     stdscr.refresh()
     
     val = stdscr.getstr(y, min(x + len(prompt_text), stdscr.getmaxyx()[1] - 2), max_len).decode('utf-8').strip()
@@ -549,20 +607,26 @@ def gui(stdscr, scanner):
     stdscr.nodelay(False)
     stdscr.timeout(60)
 
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_CYAN, -1)
-    curses.init_pair(2, curses.COLOR_GREEN, -1)
-    curses.init_pair(3, curses.COLOR_RED, -1)
-    curses.init_pair(4, curses.COLOR_YELLOW, -1)
-    curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    # Color Guard: Safe fallback on monochrome terminals
+    use_colors = curses.has_colors()
+    if use_colors:
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_GREEN, -1)
+        curses.init_pair(3, curses.COLOR_RED, -1)
+        curses.init_pair(4, curses.COLOR_YELLOW, -1)
+        curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_CYAN)
+
+    def cp(n):
+        return curses.color_pair(n) if use_colors else 0
 
     MIN_LINES = 14
     MIN_COLS = 75
 
     if scanner.init_error:
         stdscr.erase()
-        safe_addstr(stdscr, 2, 2, "HARDWARE INITIALIZATION ERROR", curses.color_pair(3) | curses.A_BOLD)
+        safe_addstr(stdscr, 2, 2, "HARDWARE INITIALIZATION ERROR", cp(3) | curses.A_BOLD)
         safe_addstr(stdscr, 4, 2, scanner.init_error)
         safe_addstr(stdscr, 6, 2, "Press any key to exit.")
         stdscr.refresh()
@@ -600,28 +664,28 @@ def gui(stdscr, scanner):
         h, w = max_y, max_x
 
         # Header Box
-        safe_addstr(stdscr, 1, 2, "┌" + "─" * (w - 6) + "┐", curses.color_pair(1) | curses.A_BOLD)
-        safe_addstr(stdscr, 2, 2, ("│  AIRSCAN - SDR AIRBAND MONITOR & SCANNER").ljust(w - 5) + "│", curses.color_pair(1) | curses.A_BOLD)
-        safe_addstr(stdscr, 3, 2, "└" + "─" * (w - 6) + "┘", curses.color_pair(1) | curses.A_BOLD)
+        safe_addstr(stdscr, 1, 2, "┌" + "─" * (w - 6) + "┐", cp(1) | curses.A_BOLD)
+        safe_addstr(stdscr, 2, 2, ("│  AIRSCAN - SDR AIRBAND MONITOR & SCANNER").ljust(w - 5) + "│", cp(1) | curses.A_BOLD)
+        safe_addstr(stdscr, 3, 2, "└" + "─" * (w - 6) + "┘", cp(1) | curses.A_BOLD)
 
         # Status Line
         safe_addstr(stdscr, 4, 4, "STATUS: ")
         if scanner.status == "LOCKED":
-            safe_addstr(stdscr, 4, 12, "[ LOCKED ]  ", curses.color_pair(4) | curses.A_BOLD)
+            safe_addstr(stdscr, 4, 12, "[ LOCKED ]  ", cp(4) | curses.A_BOLD)
         elif scanner.status == "HOLD":
-            safe_addstr(stdscr, 4, 12, "[  HOLD  ]  ", curses.color_pair(4) | curses.A_BOLD)
+            safe_addstr(stdscr, 4, 12, "[  HOLD  ]  ", cp(4) | curses.A_BOLD)
         else:
-            safe_addstr(stdscr, 4, 12, "[ SCANNING ]", curses.color_pair(2))
+            safe_addstr(stdscr, 4, 12, "[ SCANNING ]", cp(2))
 
         # VOX Recording Control
         safe_addstr(stdscr, 4, 28, "MP3 VOX REC: ")
         if not scanner.ffmpeg_available:
-            safe_addstr(stdscr, 4, 41, "FFMPEG MISSING", curses.color_pair(3))
+            safe_addstr(stdscr, 4, 41, "FFMPEG MISSING", cp(3))
         elif scanner.recording:
             if scanner.vox_active:
-                safe_addstr(stdscr, 4, 41, "● CAPTURING", curses.color_pair(3) | curses.A_BOLD)
+                safe_addstr(stdscr, 4, 41, "● CAPTURING", cp(3) | curses.A_BOLD)
             else:
-                safe_addstr(stdscr, 4, 41, "○ WAITING  ", curses.color_pair(3))
+                safe_addstr(stdscr, 4, 41, "○ WAITING  ", cp(3))
         else:
             safe_addstr(stdscr, 4, 41, "OFF/STANDBY", curses.A_DIM)
 
@@ -644,8 +708,8 @@ def gui(stdscr, scanner):
 
         # Table Header
         header_text = f"  {'CH':<4} {'FREQ (MHz)':<12} {'CHANNEL / AGENCY':<22} {'HITS':<6} {'AIRTIME':<9} {'LAST HEARD':<12}"
-        safe_addstr(stdscr, 8, 2, header_text, curses.color_pair(1) | curses.A_BOLD)
-        safe_addstr(stdscr, 9, 2, "─" * (w - 4), curses.color_pair(1))
+        safe_addstr(stdscr, 8, 2, header_text, cp(1) | curses.A_BOLD)
+        safe_addstr(stdscr, 9, 2, "─" * (w - 4), cp(1))
 
         with scanner.channel_lock:
             max_visible = max(1, h - 14)
@@ -666,9 +730,9 @@ def gui(stdscr, scanner):
                     line = f"{prefix}{i+1:<4} {ch['freq']:<12.3f} {name_str:<22} {ch['hits']:<6} {airtime_str:<9} {ch['last']:<12}"
 
                     if is_selected:
-                        safe_addstr(stdscr, row_y, 2, line.ljust(w - 6), curses.color_pair(5))
+                        safe_addstr(stdscr, row_y, 2, line.ljust(w - 6), cp(5))
                     elif is_active:
-                        color = curses.color_pair(4) if scanner.status in ["LOCKED", "HOLD"] else curses.color_pair(2)
+                        color = cp(4) if scanner.status in ["LOCKED", "HOLD"] else cp(2)
                         safe_addstr(stdscr, row_y, 2, line.ljust(w - 6), color | curses.A_BOLD)
                     else:
                         safe_addstr(stdscr, row_y, 2, line.ljust(w - 6))
@@ -677,8 +741,8 @@ def gui(stdscr, scanner):
 
         # Footer Controls
         footer_y = max(11 + max_visible, h - 3)
-        safe_addstr(stdscr, footer_y, 2, "─" * (w - 4), curses.color_pair(1))
-        safe_addstr(stdscr, footer_y + 1, 2, " [A] Add  [C] Clr Hits  [R] Rec  [+/-] Squelch  [SPACE] Hold  [G] Gain  [Q] Quit ", curses.color_pair(1))
+        safe_addstr(stdscr, footer_y, 2, "─" * (w - 4), cp(1))
+        safe_addstr(stdscr, footer_y + 1, 2, " [A] Add  [C] Clr Hits  [R] Rec  [+/-] Squelch  [SPACE] Hold  [G] Gain  [Q] Quit ", cp(1))
 
         try:
             key = stdscr.getch()
@@ -697,11 +761,11 @@ def gui(stdscr, scanner):
             scanner.clear_hits()
         elif key in [ord('a'), ord('A')]:
             prompt_y = footer_y + 1
-            f_str = prompt_user_input(stdscr, "Enter Frequency in MHz (e.g. 122.950): ", prompt_y, 2, max_len=10)
+            f_str = prompt_user_input(stdscr, "Enter Frequency in MHz (e.g. 122.950): ", prompt_y, 2, max_len=10, c_attr=cp(4))
             if f_str:
                 try:
                     f_val = float(f_str)
-                    lbl_str = prompt_user_input(stdscr, "Enter Agency/Channel Name: ", prompt_y, 2, max_len=21)
+                    lbl_str = prompt_user_input(stdscr, "Enter Agency/Channel Name: ", prompt_y, 2, max_len=21, c_attr=cp(4))
                     if not lbl_str:
                         lbl_str = f"{f_val:.3f} MHz"
                     scanner.add_channel(f_val, lbl_str)
@@ -803,8 +867,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        scanner.close()
+        # Strict Shutdown Sequence: Stop loop -> Wait for worker to finish -> Free C hardware
+        scanner.running = False
         worker.join(timeout=1.0)
+        scanner.close()
 
 if __name__ == "__main__":
     main()
