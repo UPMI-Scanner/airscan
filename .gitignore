@@ -1,5 +1,16 @@
 __pycache__/
 *.pyc
-recordings/
-*.wav
-*.mp3
+*.pyo
+*.pyd
+.pytest_cache/
+recordings/*.mp3
+recordings/*.wav
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Experimental / Test Scripts
+airscan_fast.py
+test_fast_scan.py
+*.bak
