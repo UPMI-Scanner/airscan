@@ -26,7 +26,7 @@ from datetime import datetime
 # CONFIGURATION & DEFAULT PATHS
 # -------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.realpath(__file__))
-DEFAULT_CSV_FILE = os.path.join(BASE_DIR, "frequencies.csv")
+DEFAULT_CSV_FILE = os.path.join(BASE_DIR, os.path.join(os.path.dirname(os.path.abspath(__file__)), "frequencies.csv"))
 RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
