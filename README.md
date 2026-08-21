@@ -41,7 +41,7 @@ sudo apt install -y git rtl-sdr librtlsdr-dev ffmpeg libportaudio2 python3-numpy
 Prevent the default DVB TV tuner driver from claiming the RTL-SDR dongle:
 ```bash
 # Add user to hardware access group
-sudo usermod -aG plugdev,audio eddie
+sudo usermod -aG plugdev,audio "user"
 
 # Blacklist default kernel TV drivers
 sudo bash -c 'cat << "BL_EOF" > /etc/modprobe.d/blacklist-rtlsdr.conf
