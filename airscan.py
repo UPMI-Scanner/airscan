@@ -1,0 +1,667 @@
+#!/usr/bin/env python3
+"""
+AirScan: VHF AM Aviation Radio Scanner & VOX Audio Recorder
+Direct librtlsdr C-bindings, NumPy DSP demodulation, auto-squelch, and NCurses TUI.
+"""
+
+import os
+import sys
+import time
+import math
+import ctypes
+import ctypes.util
+import argparse
+import curses
+import subprocess
+import queue
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+import numpy as np
+import sounddevice as sd
+
+# =====================================================================
+# SYSTEM & DSP CONSTANTS
+# =====================================================================
+SDR_SAMPLE_RATE: int = 1024000
+AUDIO_RATE: int = 32000
+DECIMATION: int = SDR_SAMPLE_RATE // AUDIO_RATE  # 32
+CHUNK_SAMPLES: int = 16384
+BYTES_PER_CHUNK: int = CHUNK_SAMPLES * 2
+
+def _generate_fir_filter(taps: int = 31, cutoff_hz: float = 3200.0, fs: float = SDR_SAMPLE_RATE) -> np.ndarray:
+    n = np.arange(taps) - (taps - 1) / 2.0
+    fc = cutoff_hz / fs
+    h = np.sinc(2.0 * fc * n) * (2.0 * fc)
+    h *= np.hamming(taps)
+    return (h / np.sum(h)).astype(np.float32)
+
+FIR_TAPS: np.ndarray = _generate_fir_filter(31, 3200.0, SDR_SAMPLE_RATE)
+
+# =====================================================================
+# DATA STRUCTURES
+# =====================================================================
+@dataclass
+class Channel:
+    freq_hz: int
+    name: str
+    hits: int = 0
+    total_airtime_sec: float = 0.0
+    last_heard: str = ""
+
+# =====================================================================
+# C-STDERR SUPPRESSION (Prevents libusb/ALSA logs from corrupting curses)
+# =====================================================================
+class CStderrSilencer:
+    def __enter__(self):
+        sys.stderr.flush()
+        self.orig_stderr_fd = sys.stderr.fileno()
+        self.saved_stderr_fd = os.dup(self.orig_stderr_fd)
+        self.devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(self.devnull_fd, self.orig_stderr_fd)
+        os.close(self.devnull_fd)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.stderr.flush()
+        os.dup2(self.saved_stderr_fd, self.orig_stderr_fd)
+        os.close(self.saved_stderr_fd)
+
+# =====================================================================
+# DIRECT RTL-SDR C-BINDINGS (librtlsdr)
+# =====================================================================
+class LibRTLSDR:
+    def __init__(self, device_index: int = 0):
+        lib_path = ctypes.util.find_library("rtlsdr") or "librtlsdr.so.0" or "librtlsdr.so"
+        try:
+            self.lib = ctypes.CDLL(lib_path)
+        except OSError as err:
+            raise RuntimeError(f"Unable to load librtlsdr: {err}. Please run: sudo apt install librtlsdr-dev")
+
+        self._setup_prototypes()
+        self.dev = ctypes.c_void_p()
+        with CStderrSilencer():
+            ret = self.lib.rtlsdr_open(ctypes.byref(self.dev), device_index)
+        if ret != 0 or not self.dev:
+            raise RuntimeError(f"Failed to open RTL-SDR device index {device_index}.")
+
+        self.supported_gains = self._get_gains()
+
+    def _setup_prototypes(self):
+        self.lib.rtlsdr_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32]
+        self.lib.rtlsdr_open.restype = ctypes.c_int
+        self.lib.rtlsdr_close.argtypes = [ctypes.c_void_p]
+        self.lib.rtlsdr_close.restype = ctypes.c_int
+        self.lib.rtlsdr_set_center_freq.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        self.lib.rtlsdr_set_center_freq.restype = ctypes.c_int
+        self.lib.rtlsdr_set_sample_rate.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        self.lib.rtlsdr_set_sample_rate.restype = ctypes.c_int
+        self.lib.rtlsdr_set_tuner_gain_mode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.lib.rtlsdr_set_tuner_gain_mode.restype = ctypes.c_int
+        self.lib.rtlsdr_set_tuner_gain.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.lib.rtlsdr_set_tuner_gain.restype = ctypes.c_int
+        self.lib.rtlsdr_set_freq_correction.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.lib.rtlsdr_set_freq_correction.restype = ctypes.c_int
+        self.lib.rtlsdr_reset_buffer.argtypes = [ctypes.c_void_p]
+        self.lib.rtlsdr_reset_buffer.restype = ctypes.c_int
+        self.lib.rtlsdr_read_sync.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+        self.lib.rtlsdr_read_sync.restype = ctypes.c_int
+        self.lib.rtlsdr_get_tuner_gains.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        self.lib.rtlsdr_get_tuner_gains.restype = ctypes.c_int
+
+    def _get_gains(self) -> List[float]:
+        num_gains = self.lib.rtlsdr_get_tuner_gains(self.dev, None)
+        if num_gains <= 0:
+            return [0.0, 15.0, 28.0, 36.0, 42.1, 49.6]
+        gains_arr = (ctypes.c_int * num_gains)()
+        self.lib.rtlsdr_get_tuner_gains(self.dev, gains_arr)
+        return [g / 10.0 for g in gains_arr]
+
+    def set_sample_rate(self, rate: int):
+        self.lib.rtlsdr_set_sample_rate(self.dev, rate)
+
+    def set_center_freq(self, freq_hz: int):
+        self.lib.rtlsdr_set_center_freq(self.dev, freq_hz)
+
+    def set_gain(self, gain_db: float):
+        self.lib.rtlsdr_set_tuner_gain_mode(self.dev, 1)
+        self.lib.rtlsdr_set_tuner_gain(self.dev, int(gain_db * 10))
+
+    def set_ppm(self, ppm: int):
+        self.lib.rtlsdr_set_freq_correction(self.dev, ppm)
+
+    def reset_buffer(self):
+        self.lib.rtlsdr_reset_buffer(self.dev)
+
+    def read_samples(self, num_samples: int) -> np.ndarray:
+        raw_bytes = (ctypes.c_ubyte * (num_samples * 2))()
+        n_read = ctypes.c_int()
+        ret = self.lib.rtlsdr_read_sync(self.dev, ctypes.byref(raw_bytes), num_samples * 2, ctypes.byref(n_read))
+        if ret != 0:
+            return np.zeros(num_samples, dtype=np.complex64)
+        data = np.frombuffer(raw_bytes, dtype=np.uint8).astype(np.float32)
+        data = (data - 127.5) / 127.5
+        return data[0::2] + 1j * data[1::2]
+
+    def close(self):
+        if self.dev:
+            with CStderrSilencer():
+                self.lib.rtlsdr_close(self.dev)
+            self.dev = None
+
+# =====================================================================
+# AUDIO DSP & VOICE BANDPASS FILTER (300 Hz - 3500 Hz)
+# =====================================================================
+class VoiceBandpassFilter:
+    def __init__(self, sample_rate: int = AUDIO_RATE, low_cut: float = 300.0, high_cut: float = 3500.0):
+        self.enabled = True
+        self.sr = sample_rate
+        self.a1, self.a2 = 0.0, 0.0
+        self.b0, self.b1, self.b2 = 1.0, 0.0, 0.0
+        self.z1, self.z2 = 0.0, 0.0
+        self._calculate_coefficients(low_cut, high_cut)
+
+    def _calculate_coefficients(self, low: float, high: float):
+        w0 = 2.0 * math.pi * math.sqrt(low * high) / self.sr
+        bw = (high - low) / math.sqrt(low * high)
+        alpha = math.sin(w0) * math.sinh(math.log(2.0) / 2.0 * bw * w0 / math.sin(w0))
+        b0 = alpha
+        b1 = 0.0
+        b2 = -alpha
+        a0 = 1.0 + alpha
+        a1 = -2.0 * math.cos(w0)
+        a2 = 1.0 - alpha
+        self.b0, self.b1, self.b2 = b0 / a0, b1 / a0, b2 / a0
+        self.a1, self.a2 = a1 / a0, a2 / a0
+
+    def process(self, audio: np.ndarray) -> np.ndarray:
+        if not self.enabled or len(audio) == 0:
+            return audio
+        out = np.empty_like(audio)
+        z1, z2 = self.z1, self.z2
+        b0, b1, b2 = self.b0, self.b1, self.b2
+        a1, a2 = self.a1, self.a2
+        for i in range(len(audio)):
+            x = audio[i]
+            y = b0 * x + z1
+            z1 = b1 * x - a1 * y + z2
+            z2 = b2 * x - a2 * y
+            out[i] = y
+        self.z1, self.z2 = z1, z2
+        return out
+
+# =====================================================================
+# VOX RECORDING PIPELINE
+# =====================================================================
+class AudioRecorder:
+    def __init__(self, record_dir: str = "recordings"):
+        self.record_dir = record_dir
+        os.makedirs(self.record_dir, exist_ok=True)
+        self.process: Optional[subprocess.Popen] = None
+        self.current_filename: str = ""
+
+    def start(self, freq_hz: int, name: str):
+        self.stop()
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        clean_name = "".join(c if c.isalnum() else "_" for c in name).strip("_")
+        self.current_filename = os.path.join(
+            self.record_dir, f"Airband_{ts}_{freq_hz/1e6:.3f}MHz_{clean_name}.mp3"
+        )
+        cmd = [
+            "ffmpeg", "-y", "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", "1",
+            "-i", "pipe:0", "-af", "dynaudnorm=f=150:g=15", "-q:a", "2",
+            self.current_filename
+        ]
+        self.process = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+    def write(self, audio: np.ndarray):
+        if self.process and self.process.stdin:
+            pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+            try:
+                self.process.stdin.write(pcm)
+                self.process.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self.stop()
+
+    def stop(self):
+        if self.process:
+            if self.process.stdin:
+                try:
+                    self.process.stdin.close()
+                except OSError:
+                    pass
+            self.process.wait()
+            self.process = None
+
+# =====================================================================
+# CORE SCANNER ENGINE
+# =====================================================================
+class AirScanEngine:
+    def __init__(self, channels: List[Channel], gain: float = 36.0, squelch_db: float = -45.0,
+                 ppm: int = 0, dev_idx: int = 0, no_audio: bool = False, raw_filter: bool = False):
+        self.channels = channels
+        self.gain = gain
+        self.manual_squelch_db = squelch_db
+        self.auto_squelch = True
+        self.snr_threshold_db = 8.5
+        self.recording_enabled = False
+        self.no_audio = no_audio
+
+        self.sdr = LibRTLSDR(dev_idx)
+        self.sdr.set_sample_rate(SDR_SAMPLE_RATE)
+        self.sdr.set_gain(self.gain)
+        self.sdr.set_ppm(ppm)
+
+        self.voice_filter = VoiceBandpassFilter()
+        self.voice_filter.enabled = not raw_filter
+        self.recorder = AudioRecorder()
+
+        self.current_channel: Optional[Channel] = None
+        self.hold_channel: Optional[Channel] = None
+        self.selected_idx: int = 0
+
+        self.running = True
+        self.squelch_open = False
+        self.hang_count = 0
+        self.max_dwell_count = 0
+        self.agc_peak = 0.05
+        self.noise_floor_db = -65.0
+
+        self.current_rssi = -90.0
+        self.current_snr = 0.0
+        self.total_vox_samples = 0
+        self.total_session_samples = 0
+
+        self.audio_queue = queue.Queue(maxsize=30)
+        self.playback_proc: Optional[subprocess.Popen] = None
+        self.latest_recording_path: str = ""
+
+        if not self.no_audio:
+            self.stream = sd.OutputStream(
+                samplerate=AUDIO_RATE, channels=1, dtype='float32',
+                callback=self._audio_callback, blocksize=512
+            )
+            self.stream.start()
+        else:
+            self.stream = None
+
+    def _audio_callback(self, outdata, frames, time_info, status):
+        try:
+            chunk = self.audio_queue.get_nowait()
+            n = min(len(chunk), frames)
+            outdata[:n, 0] = chunk[:n]
+            if n < frames:
+                outdata[n:, 0] = 0.0
+        except queue.Empty:
+            outdata.fill(0.0)
+
+    def demodulate_am(self, iq_samples: np.ndarray) -> np.ndarray:
+        i_filt = np.convolve(iq_samples.real, FIR_TAPS, mode='same')[::DECIMATION]
+        q_filt = np.convolve(iq_samples.imag, FIR_TAPS, mode='same')[::DECIMATION]
+        iq_channel = i_filt + 1j * q_filt
+
+        mag = np.abs(iq_channel)
+        audio = mag - np.mean(mag)
+
+        chunk_peak = float(np.max(np.abs(audio))) if len(audio) > 0 else 0.01
+        self.agc_peak = max(chunk_peak, (self.agc_peak * 0.96) + (chunk_peak * 0.04))
+        target_gain = min(0.85 / max(self.agc_peak, 0.01), 12.0)
+        return np.clip(audio * target_gain, -1.0, 1.0).astype(np.float32)
+
+    def calculate_power(self, iq_samples: np.ndarray) -> Tuple[float, float]:
+        pwr = float(np.mean(np.abs(iq_samples) ** 2))
+        rssi_db = 10.0 * math.log10(max(pwr, 1e-12))
+        if rssi_db < self.noise_floor_db:
+            self.noise_floor_db = (self.noise_floor_db * 0.95) + (rssi_db * 0.05)
+        else:
+            self.noise_floor_db = (self.noise_floor_db * 0.999) + (rssi_db * 0.001)
+        snr_db = max(0.0, rssi_db - self.noise_floor_db)
+        return rssi_db, snr_db
+
+    def toggle_playback(self):
+        if self.playback_proc and self.playback_proc.poll() is None:
+            self.playback_proc.terminate()
+            self.playback_proc = None
+            return
+
+        target_file = ""
+        if self.selected_idx < len(self.channels):
+            sel_ch = self.channels[self.selected_idx]
+            freq_str = f"{sel_ch.freq_hz / 1e6:.3f}MHz"
+            files = sorted(
+                [os.path.join("recordings", f) for f in os.listdir("recordings") if freq_str in f and f.endswith(".mp3")],
+                key=os.path.getmtime, reverse=True
+            ) if os.path.exists("recordings") else []
+            if files:
+                target_file = files[0]
+
+        if not target_file and self.latest_recording_path and os.path.exists(self.latest_recording_path):
+            target_file = self.latest_recording_path
+
+        if target_file:
+            self.playback_proc = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", target_file],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+
+    def cycle_gain(self):
+        gains = self.sdr.supported_gains
+        if not gains:
+            return
+        idx = 0
+        for i, g in enumerate(gains):
+            if abs(g - self.gain) < 0.2:
+                idx = (i + 1) % len(gains)
+                break
+        self.gain = gains[idx]
+        self.sdr.set_gain(self.gain)
+
+    def step(self):
+        if self.hold_channel:
+            target = self.hold_channel
+        else:
+            target = self.channels[self.selected_idx % len(self.channels)]
+            if not self.squelch_open:
+                self.selected_idx = (self.selected_idx + 1) % len(self.channels)
+
+        if self.current_channel != target:
+            self.current_channel = target
+            self.sdr.set_center_freq(target.freq_hz)
+            self.sdr.reset_buffer()
+            self.sdr.read_samples(4096)
+
+        raw_iq = self.sdr.read_samples(CHUNK_SAMPLES)
+        self.current_rssi, self.current_snr = self.calculate_power(raw_iq)
+
+        if self.auto_squelch:
+            trigger = (self.current_snr >= self.snr_threshold_db)
+            maintain = (self.current_snr >= (self.snr_threshold_db - 3.0))
+        else:
+            trigger = (self.current_rssi >= self.manual_squelch_db)
+            maintain = (self.current_rssi >= (self.manual_squelch_db - 3.0))
+
+        if trigger or (self.squelch_open and maintain):
+            if not self.squelch_open:
+                target.hits += 1
+                target.last_heard = time.strftime("%H:%M:%S")
+                if self.recording_enabled:
+                    self.recorder.start(target.freq_hz, target.name)
+                    self.latest_recording_path = self.recorder.current_filename
+                self.total_vox_samples = 0
+            self.squelch_open = True
+            self.hang_count = 90
+            self.max_dwell_count += 1
+        else:
+            if self.hang_count > 0:
+                self.hang_count -= 1
+            else:
+                if self.squelch_open and self.recording_enabled:
+                    self.recorder.stop()
+                self.squelch_open = False
+                self.max_dwell_count = 0
+
+        if self.max_dwell_count > 1800:
+            self.squelch_open = False
+            self.hang_count = 0
+            if self.recording_enabled:
+                self.recorder.stop()
+
+        if self.squelch_open:
+            target.total_airtime_sec += (len(raw_iq) / SDR_SAMPLE_RATE)
+            audio = self.demodulate_am(raw_iq)
+            filt_audio = self.voice_filter.process(audio)
+
+            if self.recording_enabled:
+                self.recorder.write(filt_audio)
+                self.total_vox_samples += len(filt_audio)
+                self.total_session_samples += len(filt_audio)
+
+            if not self.no_audio:
+                try:
+                    self.audio_queue.put_nowait(filt_audio)
+                except queue.Full:
+                    pass
+
+    def close(self):
+        self.running = False
+        if self.recorder:
+            self.recorder.stop()
+        if self.playback_proc:
+            self.playback_proc.terminate()
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+        self.sdr.close()
+
+# =====================================================================
+# NCURSES TERMINAL UI
+# =====================================================================
+def safe_addstr(win, y: int, x: int, text: str, attr: int = 0):
+    max_y, max_x = win.getmaxyx()
+    if 0 <= y < max_y and 0 <= x < max_x:
+        win.addstr(y, x, text[:max_x - x - 1], attr)
+
+def curses_main(stdscr, scanner: AirScanEngine):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    stdscr.keypad(True)
+    stdscr.nodelay(True)
+    stdscr.timeout(40)
+
+    curses.init_pair(1, curses.COLOR_GREEN, -1)
+    curses.init_pair(2, curses.COLOR_RED, -1)
+    curses.init_pair(3, curses.COLOR_CYAN, -1)
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(6, curses.COLOR_WHITE, -1)
+    curses.init_pair(7, curses.COLOR_BLUE, -1)
+
+    while scanner.running:
+        try:
+            key = stdscr.getch()
+        except curses.error:
+            key = -1
+
+        if key in (ord('q'), ord('Q')):
+            break
+        elif key == ord(' '):
+            if scanner.hold_channel:
+                scanner.hold_channel = None
+            else:
+                scanner.hold_channel = scanner.current_channel
+        elif key in (ord('f'), ord('F')):
+            scanner.voice_filter.enabled = not scanner.voice_filter.enabled
+        elif key in (ord('a'), ord('A')):
+            scanner.auto_squelch = not scanner.auto_squelch
+        elif key in (ord('r'), ord('R')):
+            scanner.recording_enabled = not scanner.recording_enabled
+            if not scanner.recording_enabled:
+                scanner.recorder.stop()
+        elif key in (ord('p'), ord('P')):
+            scanner.toggle_playback()
+        elif key in (ord('c'), ord('C')):
+            for ch in scanner.channels:
+                ch.hits = 0
+                ch.total_airtime_sec = 0.0
+                ch.last_heard = ""
+        elif key in (ord('g'), ord('G')):
+            scanner.cycle_gain()
+        elif key in (ord('+'), ord('=')):
+            if scanner.auto_squelch:
+                scanner.snr_threshold_db = min(25.0, scanner.snr_threshold_db + 0.5)
+            else:
+                scanner.manual_squelch_db = min(-10.0, scanner.manual_squelch_db + 1.0)
+        elif key in (ord('-'), ord('_')):
+            if scanner.auto_squelch:
+                scanner.snr_threshold_db = max(3.0, scanner.snr_threshold_db - 0.5)
+            else:
+                scanner.manual_squelch_db = max(-80.0, scanner.manual_squelch_db - 1.0)
+        elif key in (curses.KEY_UP, ord('k')):
+            scanner.selected_idx = (scanner.selected_idx - 1) % len(scanner.channels)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            scanner.selected_idx = (scanner.selected_idx + 1) % len(scanner.channels)
+        elif key in (10, 13, curses.KEY_ENTER):
+            scanner.hold_channel = scanner.channels[scanner.selected_idx]
+
+        scanner.step()
+
+        stdscr.erase()
+        max_y, max_x = stdscr.getmaxyx()
+
+        title = " AIRSCAN // VHF AVIATION SCANNER & RECORDER "
+        safe_addstr(stdscr, 0, 0, "╔" + "═" * (max_x - 2) + "╗", curses.color_pair(7))
+        safe_addstr(stdscr, 1, max(2, (max_x - len(title)) // 2), title, curses.color_pair(6) | curses.A_BOLD)
+        safe_addstr(stdscr, 2, 0, "╠" + "═" * (max_x - 2) + "╣", curses.color_pair(7))
+
+        sq_str = f"AUTO ({scanner.snr_threshold_db:.1f} dB)" if scanner.auto_squelch else f"MAN ({scanner.manual_squelch_db:.0f} dBFS)"
+        flt_str = "BPF (300-3.5k)" if scanner.voice_filter.enabled else "RAW (FULL AM)"
+        stat_l1 = f" SQUELCH: [{sq_str:<15}]  GAIN: [{scanner.gain:>4.1f} dB]  FILTER: [{flt_str:<14}]"
+        safe_addstr(stdscr, 3, 2, stat_l1, curses.color_pair(6))
+
+        sig_bars = max(0, min(15, int((scanner.current_rssi + 75.0) / 3.0)))
+        smeter = "■" * sig_bars + "─" * (15 - sig_bars)
+        act_col = curses.color_pair(1) | curses.A_BOLD if scanner.squelch_open else curses.A_DIM
+        act_str = "ACTIVE VOICE" if scanner.squelch_open else "IDLE / SWEEP"
+
+        call_sec = int(scanner.total_vox_samples / AUDIO_RATE)
+        tot_sec = int(scanner.total_session_samples / AUDIO_RATE)
+        call_time = f"{call_sec // 60:02d}:{call_sec % 60:02d}"
+        tot_time = f"{tot_sec // 60:02d}:{tot_sec % 60:02d}"
+
+        if scanner.recording_enabled:
+            rec_str = f"● REC {call_time}" if scanner.squelch_open else f"○ WAIT ({tot_time})"
+            rec_col = curses.color_pair(2) | curses.A_BOLD if scanner.squelch_open else curses.color_pair(4)
+        else:
+            rec_str = "STANDBY"
+            rec_col = curses.A_DIM
+
+        safe_addstr(stdscr, 4, 2, f" SIGNAL: [{smeter}] {scanner.current_rssi:>5.1f} dBFS  STATE: [{act_str:<12}]", act_col)
+        safe_addstr(stdscr, 4, 56, f"VOX: [{rec_str:<15}]", rec_col)
+
+        safe_addstr(stdscr, 5, 0, "╠" + "═" * (max_x - 2) + "╣", curses.color_pair(7))
+        table_hdr = "    FREQUENCY   CHANNEL NAME             HITS   AIRTIME   LAST HEARD "
+        safe_addstr(stdscr, 6, 2, table_hdr, curses.color_pair(6) | curses.A_BOLD)
+
+        table_start_row = 7
+        footer_height = 3
+        avail_table_rows = max(1, max_y - table_start_row - footer_height)
+        total_chans = len(scanner.channels)
+        sel_idx = scanner.selected_idx
+
+        scroll_offset = 0
+        if total_chans > avail_table_rows:
+            if sel_idx >= scroll_offset + avail_table_rows:
+                scroll_offset = sel_idx - avail_table_rows + 1
+            elif sel_idx < scroll_offset:
+                scroll_offset = sel_idx
+            scroll_offset = max(0, min(scroll_offset, total_chans - avail_table_rows))
+
+        visible_chans = scanner.channels[scroll_offset : scroll_offset + avail_table_rows]
+
+        for i, ch in enumerate(visible_chans):
+            actual_idx = scroll_offset + i
+            r = table_start_row + i
+            is_active = (scanner.current_channel and scanner.current_channel.freq_hz == ch.freq_hz and scanner.squelch_open)
+            is_held = (scanner.hold_channel and scanner.hold_channel.freq_hz == ch.freq_hz)
+            is_selected = (actual_idx == sel_idx)
+
+            prefix = " "
+            attr = curses.color_pair(6)
+            if is_selected:
+                prefix = ">"
+                attr = curses.color_pair(3) | curses.A_BOLD
+            if is_held:
+                prefix = "H"
+                attr = curses.color_pair(5) | curses.A_BOLD
+            if is_active:
+                prefix = "*"
+                attr = curses.color_pair(1) | curses.A_BOLD
+
+            mhz = ch.freq_hz / 1e6
+            last_hd = ch.last_heard if ch.last_heard else "--:--:--"
+            tot_air = f"{int(ch.total_airtime_sec)}s"
+
+            line_str = f" {prefix} {mhz:7.3f} MHz  {ch.name:<22} {ch.hits:>5}  {tot_air:>7}  {last_hd:>8} "
+            safe_addstr(stdscr, r, 2, line_str, attr)
+
+        footer_border_row = max_y - 3
+        footer_keys_row = max_y - 2
+        safe_addstr(stdscr, footer_border_row, 0, "╠" + "═" * (max_x - 2) + "╣", curses.color_pair(7))
+        help_text = " [SPACE] Hold  [F] Filter  [A] Auto-Sq  [R] Rec  [P] Play  [C] Clear  [G] Gain  [Q] Quit "
+        safe_addstr(stdscr, footer_keys_row, 2, help_text, curses.color_pair(6) | curses.A_BOLD)
+        safe_addstr(stdscr, max_y - 1, 0, "╚" + "═" * (max_x - 2) + "╝", curses.color_pair(7))
+
+        stdscr.refresh()
+
+# =====================================================================
+# CONFIGURATION & ENTRY POINT
+# =====================================================================
+def load_frequencies(csv_path: str) -> List[Channel]:
+    if not os.path.exists(csv_path):
+        defaults = [
+            (118.000, "Tower"),
+            (121.500, "Emergency Guard"),
+            (121.900, "Ground Control"),
+            (122.700, "UNICOM"),
+            (122.800, "CTAF Local"),
+            (122.900, "Multicom"),
+            (123.025, "Helicopter Air-Air"),
+            (127.200, "Minneapolis Center"),
+            (134.100, "Approach / Departure")
+        ]
+        with open(csv_path, "w", encoding="utf-8") as f:
+            for mhz, name in defaults:
+                f.write(f"{mhz:.3f},{name}\n")
+
+    channels: List[Channel] = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) >= 2:
+                try:
+                    freq_hz = int(round(float(parts[0].strip()) * 1e6))
+                    name = parts[1].strip()
+                    channels.append(Channel(freq_hz=freq_hz, name=name))
+                except ValueError:
+                    continue
+    return channels
+
+def main():
+    parser = argparse.ArgumentParser(description="AirScan: Professional VHF AM Aviation Radio Scanner")
+    parser.add_argument("-c", "--config", default="frequencies.csv", help="Path to frequency CSV file")
+    parser.add_argument("-g", "--gain", type=float, default=36.0, help="Hardware RF gain in dB")
+    parser.add_argument("-s", "--squelch", type=float, default=-45.0, help="Manual squelch threshold in dBFS")
+    parser.add_argument("-p", "--ppm", type=int, default=0, help="Crystal frequency correction in PPM")
+    parser.add_argument("-d", "--device", type=int, default=0, help="RTL-SDR USB device index")
+    parser.add_argument("--no-audio", action="store_true", help="Disable live speaker audio output")
+    parser.add_argument("--raw", action="store_true", help="Start with raw audio (disable BPF voice filter on launch)")
+    args = parser.parse_args()
+
+    channels = load_frequencies(args.config)
+    if not channels:
+        print(f"[-] Error: No valid frequencies found in {args.config}")
+        sys.exit(1)
+
+    scanner = None
+    try:
+        scanner = AirScanEngine(
+            channels=channels, gain=args.gain, squelch_db=args.squelch,
+            ppm=args.ppm, dev_idx=args.device, no_audio=args.no_audio,
+            raw_filter=args.raw
+        )
+        curses.wrapper(curses_main, scanner)
+    except KeyboardInterrupt:
+        pass
+    except Exception as err:
+        print(f"\n[-] Runtime exception: {err}")
+    finally:
+        if scanner:
+            scanner.close()
+        print("\n[✓] AirScan terminated cleanly. Audio streams and SDR hardware released.")
+
+if __name__ == "__main__":
+    main()
