@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AirScan: VHF AM Aviation Radio Scanner & VOX Audio Recorder
-Direct librtlsdr C-bindings, NumPy DSP demodulation, per-channel adaptive auto-squelch, and NCurses TUI.
+Direct librtlsdr C-bindings, NumPy DSP demodulation, dynamic auto-squelch, and NCurses TUI.
 """
 
 import os
@@ -14,6 +14,7 @@ import argparse
 import curses
 import subprocess
 import queue
+import collections
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import numpy as np
@@ -26,6 +27,7 @@ SDR_SAMPLE_RATE: int = 1024000
 AUDIO_RATE: int = 32000
 DECIMATION: int = SDR_SAMPLE_RATE // AUDIO_RATE  # 32
 CHUNK_SAMPLES: int = 16384
+PREROLL_CHUNKS: int = 8  # ~400ms rolling memory buffer
 
 def _generate_fir_filter(taps: int = 31, cutoff_hz: float = 3200.0, fs: float = SDR_SAMPLE_RATE) -> np.ndarray:
     n = np.arange(taps) - (taps - 1) / 2.0
@@ -48,6 +50,7 @@ class Channel:
     last_heard: str = ""
     noise_floor_db: float = -90.0
     noise_initialized: bool = False
+    consecutive_hits: int = 0
 
 # =====================================================================
 # C-STDERR SUPPRESSION
@@ -194,19 +197,21 @@ class VoiceBandpassFilter:
 # VOX RECORDING PIPELINE
 # =====================================================================
 class AudioRecorder:
-    def __init__(self, record_dir: str = "recordings"):
-        self.record_dir = record_dir
+    def __init__(self, record_dir: str = ""):
+        self.record_dir = os.path.expanduser("~/airscan/recordings") if not record_dir else os.path.expanduser(record_dir)
         os.makedirs(self.record_dir, exist_ok=True)
         self.process: Optional[subprocess.Popen] = None
         self.current_filename: str = ""
+        self.samples_written: int = 0
 
-    def start(self, freq_hz: int, name: str):
+    def start(self, freq_hz: int, name: str, preroll: List[np.ndarray]):
         self.stop()
         ts = time.strftime("%Y%m%d_%H%M%S")
         clean_name = "".join(c if c.isalnum() else "_" for c in name).strip("_")
         self.current_filename = os.path.join(
             self.record_dir, f"Airband_{ts}_{freq_hz/1e6:.3f}MHz_{clean_name}.mp3"
         )
+        self.samples_written = 0
         cmd = [
             "ffmpeg", "-y", "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", "1",
             "-i", "pipe:0", "-af", "dynaudnorm=f=150:g=15", "-q:a", "2",
@@ -215,6 +220,8 @@ class AudioRecorder:
         self.process = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
+        for chunk in preroll:
+            self.write(chunk)
 
     def write(self, audio: np.ndarray):
         if self.process and self.process.stdin:
@@ -222,6 +229,7 @@ class AudioRecorder:
             try:
                 self.process.stdin.write(pcm)
                 self.process.stdin.flush()
+                self.samples_written += len(audio)
             except (BrokenPipeError, OSError):
                 self.stop()
 
@@ -234,6 +242,13 @@ class AudioRecorder:
                     pass
             self.process.wait()
             self.process = None
+
+            duration_sec = self.samples_written / AUDIO_RATE
+            if duration_sec < 0.8 and self.current_filename and os.path.exists(self.current_filename):
+                try:
+                    os.remove(self.current_filename)
+                except OSError:
+                    pass
 
 # =====================================================================
 # CORE AIRSCAN ENGINE
@@ -257,6 +272,10 @@ class AirScanEngine:
         self.voice_filter = VoiceBandpassFilter()
         self.voice_filter.enabled = not raw_filter
         self.recorder = AudioRecorder()
+
+        self.preroll_buffers: collections.defaultdict = collections.defaultdict(
+            lambda: collections.deque(maxlen=PREROLL_CHUNKS)
+        )
 
         self.current_channel: Optional[Channel] = None
         self.hold_channel: Optional[Channel] = None
@@ -320,20 +339,26 @@ class AirScanEngine:
         snr_db = max(0.0, rssi_db - ch.noise_floor_db)
 
         if self.auto_squelch:
-            trigger = (snr_db >= self.snr_threshold_db)
+            raw_trigger = (snr_db >= self.snr_threshold_db)
             maintain = (snr_db >= max(2.5, self.snr_threshold_db - 3.0))
         else:
-            trigger = (rssi_db >= self.manual_squelch_db)
+            raw_trigger = (rssi_db >= self.manual_squelch_db)
             maintain = (rssi_db >= (self.manual_squelch_db - 3.0))
 
-        # Only adapt noise floor when no voice signal is detected (freeze during speech)
-        if not self.squelch_open and not trigger:
+        if raw_trigger:
+            ch.consecutive_hits += 1
+        else:
+            ch.consecutive_hits = 0
+
+        debounced_trigger = (ch.consecutive_hits >= 2)
+
+        if not self.squelch_open and not raw_trigger:
             if rssi_db < ch.noise_floor_db:
                 ch.noise_floor_db = (ch.noise_floor_db * 0.85) + (rssi_db * 0.15)
             else:
                 ch.noise_floor_db = (ch.noise_floor_db * 0.96) + (rssi_db * 0.04)
 
-        return rssi_db, snr_db, trigger, maintain
+        return rssi_db, snr_db, debounced_trigger, maintain
 
     def toggle_playback(self):
         if self.playback_proc and self.playback_proc.poll() is None:
@@ -342,13 +367,14 @@ class AirScanEngine:
             return
 
         target_file = ""
+        rec_dir = os.path.expanduser("~/airscan/recordings")
         if self.selected_idx < len(self.channels):
             sel_ch = self.channels[self.selected_idx]
             freq_str = f"{sel_ch.freq_hz / 1e6:.3f}MHz"
             files = sorted(
-                [os.path.join("recordings", f) for f in os.listdir("recordings") if freq_str in f and f.endswith(".mp3")],
+                [os.path.join(rec_dir, f) for f in os.listdir(rec_dir) if freq_str in f and f.endswith(".mp3")],
                 key=os.path.getmtime, reverse=True
-            ) if os.path.exists("recordings") else []
+            ) if os.path.exists(rec_dir) else []
             if files:
                 target_file = files[0]
 
@@ -372,7 +398,6 @@ class AirScanEngine:
                 break
         self.gain = gains[idx]
         self.sdr.set_gain(self.gain)
-        # Invalidate baseline on gain step
         for ch in self.channels:
             ch.noise_initialized = False
 
@@ -391,6 +416,11 @@ class AirScanEngine:
             self.sdr.read_samples(4096)
 
         raw_iq = self.sdr.read_samples(CHUNK_SAMPLES)
+        audio = self.demodulate_am(raw_iq)
+        filt_audio = self.voice_filter.process(audio)
+
+        self.preroll_buffers[target.freq_hz].append(filt_audio)
+
         self.current_rssi, self.current_snr, trigger, maintain = self.evaluate_signal(raw_iq, target)
 
         if trigger or (self.squelch_open and maintain):
@@ -398,12 +428,25 @@ class AirScanEngine:
                 target.hits += 1
                 target.last_heard = time.strftime("%H:%M:%S")
                 if self.recording_enabled:
-                    self.recorder.start(target.freq_hz, target.name)
+                    preroll_data = list(self.preroll_buffers[target.freq_hz])
+                    self.recorder.start(target.freq_hz, target.name, preroll_data)
                     self.latest_recording_path = self.recorder.current_filename
                 self.total_vox_samples = 0
             self.squelch_open = True
             self.hang_count = 90
             self.max_dwell_count += 1
+            target.total_airtime_sec += (len(raw_iq) / SDR_SAMPLE_RATE)
+
+            if self.recording_enabled:
+                self.recorder.write(filt_audio)
+                self.total_vox_samples += len(filt_audio)
+                self.total_session_samples += len(filt_audio)
+
+            if not self.no_audio:
+                try:
+                    self.audio_queue.put_nowait(filt_audio)
+                except queue.Full:
+                    pass
         else:
             if self.hang_count > 0:
                 self.hang_count -= 1
@@ -418,22 +461,6 @@ class AirScanEngine:
             self.hang_count = 0
             if self.recording_enabled:
                 self.recorder.stop()
-
-        if self.squelch_open:
-            target.total_airtime_sec += (len(raw_iq) / SDR_SAMPLE_RATE)
-            audio = self.demodulate_am(raw_iq)
-            filt_audio = self.voice_filter.process(audio)
-
-            if self.recording_enabled:
-                self.recorder.write(filt_audio)
-                self.total_vox_samples += len(filt_audio)
-                self.total_session_samples += len(filt_audio)
-
-            if not self.no_audio:
-                try:
-                    self.audio_queue.put_nowait(filt_audio)
-                except queue.Full:
-                    pass
 
     def close(self):
         self.running = False
@@ -552,8 +579,8 @@ def curses_main(stdscr, scanner: AirScanEngine):
 
         sig_str = f" SIGNAL: [{smeter}] {scanner.current_rssi:>5.1f} dBFS (SNR: {scanner.current_snr:>4.1f} dB)"
         safe_addstr(stdscr, 4, 2, sig_str, act_col)
-        safe_addstr(stdscr, 4, 48, f"STATE: [{act_str:<12}]", act_col)
-        safe_addstr(stdscr, 4, 70, f"VOX: [{rec_str:<12}]", rec_col)
+        safe_addstr(stdscr, 4, 56, f"STATE: [{act_str:<14}]", act_col)
+        safe_addstr(stdscr, 4, 78, f"VOX: [{rec_str:<12}]", rec_col)
 
         safe_addstr(stdscr, 5, 0, "╠" + "═" * (max_x - 2) + "╣", curses.color_pair(7))
         table_hdr = "    FREQUENCY   CHANNEL NAME             HITS   AIRTIME   NOISE FLR   LAST HEARD "
