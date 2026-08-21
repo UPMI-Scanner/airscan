@@ -11,6 +11,5 @@ recordings/*.wav
 .DS_Store
 
 # Experimental / Test Scripts
-airscan_fast.py
 test_fast_scan.py
 *.bak

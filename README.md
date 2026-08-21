@@ -1,112 +1,116 @@
-# AirScan ✈️📻
+# AirScan // VHF AM Aviation Radio Scanner & Recorder
 
-**AirScan** is a high-performance, terminal-based VHF AM aviation radio scanner and automated VOX audio recorder built in Python. Utilizing direct `librtlsdr` C-bindings, NumPy DSP demodulation, and an interactive NCurses TUI, AirScan delivers fast channel sweeping, dynamic auto-squelch, live RF signal metering, per-transmission MP3 recording, and instant audio playback.
-
----
-
-## Features
-
-* **Interactive NCurses Dashboard:** Real-time channel activity logging, live RF S-meter, SNR/RSSI readouts, and automatic window geometry management.
-* **Dual Squelch System:**
-  * **Dynamic Relative SNR Auto-Squelch:** Automatically tracks background noise variations and triggers only on active voice transmissions.
-  * **Manual dBFS Mode:** Traditional threshold squelch for high-RF interference environments.
-* **Selectable Voice Bandpass Filtering:** Toggle instantly between full-bandwidth AM (`RAW`) and a 2nd-order transposed IIR bandpass filter (`BPF`, 300 Hz – 3.5 kHz) for enhanced speech intelligibility.
-* **Per-Call VOX MP3 Recording:** Automatic transmission capture segmented into individual MP3 files with `dynaudnorm` dynamic volume leveling.
-* **Integrated In-TUI Playback:** Instant one-key playback (`[P]`) for the selected channel or latest overall recording.
-* **Direct Hardware C-Bindings:** Interacts directly with `librtlsdr` via `ctypes` for minimum latency and zero GNU Radio dependencies.
+A lightweight, real-time VHF aviation SDR scanner and VOX audio recorder built in Python with direct `librtlsdr` C-bindings, NumPy DSP demodulation, auto-squelch SNR tracking, and an interactive NCurses terminal UI.
 
 ---
 
-## Prerequisites & Installation
+## Which Engine Should I Use?
 
-### 1. System Requirements
-* **Operating System:** Linux (Debian, Ubuntu, Linux Mint, Raspberry Pi OS, Arch Linux)
-* **Hardware:** Any standard RTL2832U-based RTL-SDR USB dongle with an appropriate VHF antenna.
+| Feature | `airscan.py` (Standard) | `airscan_fast.py` (Wideband Fast) |
+| :--- | :--- | :--- |
+| **Architecture** | Sequential hardware retuning (1.024 MSPS) | Wideband software channelizer (2.048 MSPS) |
+| **Channel Capacity** | 1 channel at a time | Simultaneous multi-channel listening |
+| **Sweep Latency** | Retunes per channel (~30–50ms hop) | Baseband decimation (0ms latency inside cluster) |
+| **Missed Calls** | Possible during long sweeps | Near zero for co-located tower/approach traffic |
+| **CPU Usage** | Minimal (~2–4% on a single core) | Low-to-Moderate (~6–10%) |
+| **Target Hardware** | Laptops, Raspberry Pi, low-power systems | Dedicated desktop stations, busy airspace hubs |
 
-### 2. Install System Packages
+---
+
+## Key Features
+
+* **Direct `librtlsdr` C-Bindings:** Low-overhead IQ sample retrieval with zero intermediate framework bloat.
+* **400ms Audio Preroll Ring Buffer:** Stores pre-trigger audio in memory so opening words of pilot transmissions are never clipped.
+* **Hardware Squelch Debounce:** Multi-frame verification filters out tuner clicks during frequency hops.
+* **Dead-Air Auto-Purge:** Momentary sub-0.3s noise bursts are automatically purged so recordings contain genuine voice conversations.
+* **Adaptive Noise Floor Calibration:** Per-channel dynamic baseline calibration tracks RF noise levels while freezing baseline updates during active transmissions.
+* **Voice-Band Filtering (BPF):** Integrated 300 Hz – 3,500 Hz bandpass filter isolates human speech from VHF background hum.
+* **Automatic Normalization:** Live audio streams directly to speakers while recorded transmissions pipe through `ffmpeg` dynamic volume normalization (`dynaudnorm`).
+
+---
+
+## Installation & Prerequisites (BunsenLabs / Debian / Ubuntu / Mint)
+
+### 1. Install System Dependencies
 ```bash
-sudo apt update && sudo apt install -y python3-numpy python3-sounddevice librtlsdr-dev ffmpeg
+sudo apt update
+sudo apt install -y git rtl-sdr librtlsdr-dev ffmpeg libportaudio2 python3-numpy python3-sounddevice
 ```
 
-### 3. Clone Repository
+### 2. Configure USB Permissions & Kernel Modules
+Prevent the default DVB TV tuner driver from claiming the RTL-SDR dongle:
 ```bash
-git clone https://github.com/UPMI-Scanner/airscan.git
-cd airscan
-chmod +x airscan.py
+# Add user to hardware access group
+sudo usermod -aG plugdev,audio eddie
+
+# Blacklist default kernel TV drivers
+sudo bash -c 'cat << "BL_EOF" > /etc/modprobe.d/blacklist-rtlsdr.conf
+blacklist dvb_usb_rtl28xxu
+blacklist rtl2832
+blacklist rtl2830
+BL_EOF'
+```
+
+### 3. Clone & Set Global Symlinks
+```bash
+git clone https://github.com/UPMI-Scanner/airscan.git ~/airscan
+cd ~/airscan
+chmod +x airscan.py airscan_fast.py
+
+# Optional: Add system-wide commands
+sudo ln -sf "/home/eddie/airscan/airscan.py" /usr/local/bin/airscan
+sudo ln -sf "/home/eddie/airscan/airscan_fast.py" /usr/local/bin/airscan-fast
 ```
 
 ---
 
-## Frequency Configuration
+## Configuration (`frequencies.csv`)
 
-Frequencies are managed via a simple CSV file (`frequencies.csv`). If no file exists, AirScan creates a default list on first launch.
+Add local airport CTAF, tower, approach, and air-to-air frequencies in comma-delimited format:
 
-Create or edit `frequencies.csv`:
 ```csv
-118.000,Tower
-121.500,Emergency Guard
-121.900,Ground Control
-122.700,UNICOM
-122.800,CTAF Local
-122.900,Multicom
-123.025,Helicopter Air-Air
-127.200,Minneapolis Center
-134.100,Approach / Departure
+122.700,Houghton CTAF
+122.800,Ironwood CTAF
+122.900,MULTICOM
+123.450,Air-to-Air
+123.725,Sector 13 Sawyer Hi
+133.550,ZMP West UP
 ```
 
 ---
 
 ## Usage
 
-### Quick Start
-```bash
-python3 airscan.py
-```
+* **Run Standard Scanner:**
+  ```bash
+  airscan
+  ```
+* **Run Wideband Fast Scanner:**
+  ```bash
+  airscan-fast
+  ```
 
-### Command-Line Options
-
-| Option | Description | Default |
-| :--- | :--- | :--- |
-| `-c, --config <file>` | Path to frequency CSV file | `frequencies.csv` |
-| `-g, --gain <dB>` | Tuner hardware RF gain in dB | `36.0` |
-| `-s, --squelch <dBFS>` | Manual squelch threshold in dBFS | `-45.0` |
-| `-p, --ppm <int>` | Frequency correction in PPM | `0` |
-| `-d, --device <index>` | RTL-SDR USB device index | `0` |
-| `--no-audio` | Headless mode: disable sound output | `False` |
-
----
-
-## Interactive Keybindings
-
-While running, manage scanning, audio, and recordings using the following keys:
-
-| Key | Action | Description |
-| :--- | :--- | :--- |
-| `[SPACE]` | **Hold / Scan** | Pauses scanning on the current channel or resumes sweeping. |
-| `[F]` | **Filter Toggle** | Cycles between `RAW` full-bandwidth AM and `BPF` (300–3500 Hz). |
-| `[A]` | **Auto Squelch** | Toggles between dynamic relative SNR and manual dBFS squelch. |
-| `[R]` | **Record VOX** | Toggles automated MP3 per-call recording on/off. |
-| `[P]` | **Instant Play** | Plays the latest recording for highlighted channel; press again to stop. |
-| `[C]` | **Clear Stats** | Resets `HITS`, `AIRTIME`, and `LAST HEARD` table counters. |
-| `[G]` | **Cycle Gain** | Steps through supported hardware gain values. |
-| `[+]` / `[-]` | **Adjust Squelch** | Adjusts SNR threshold (Auto mode) or dBFS level (Manual mode). |
-| `[↑]` / `[↓]` or `[k]` / `[j]` | **Navigate** | Moves the selection cursor through the channel list. |
-| `[ENTER]` | **Direct Hold** | Immediately tunes to and holds the highlighted channel. |
-| `[Q]` | **Quit** | Gracefully closes the tuner, flushes audio, and exits. |
+### CLI Options
+* `-c, --config`: Custom frequency CSV path (default: `frequencies.csv`)
+* `-g, --gain`: Hardware RF tuner gain in dB (default: `36.0`)
+* `-s, --squelch`: Manual squelch threshold in dBFS (default: `-45.0`)
+* `-p, --ppm`: RTL-SDR crystal frequency correction (default: `0`)
+* `-d, --device`: USB device index (default: `0`)
+* `--no-audio`: Headless operation (records without speaker playback)
+* `--raw`: Disable speech bandpass filter
 
 ---
 
-## Audio Recordings
+## Keyboard Controls
 
-When recording (`[R]`) is active, audio files are saved automatically into the `recordings/` directory using the following naming format:
-```text
-recordings/Airband_YYYYMMDD_HHMMSS_<Freq>MHz_<Channel_Name>.mp3
-```
-
-All recordings are processed through FFmpeg's `dynaudnorm` filter to equalize quiet pilots and strong local transmitters to a consistent listening volume.
-
----
-
-## License
-
-This project is licensed under the MIT License.
+| Key | Function | Description |
+| :---: | :--- | :--- |
+| **`[SPACE]`** | **Hold Channel** | Locks scanner on selected frequency to follow conversations. |
+| **`[F]`** | **Voice Filter** | Toggles between `BPF (300-3.5k)` speech isolation and raw AM. |
+| **`[A]`** | **Auto Squelch** | Toggles dynamic SNR auto-squelch tracking. |
+| **`[+]` / `[-]`** | **Sensitivity** | Adjusts SNR voice threshold in 0.5 dB increments. |
+| **`[R]`** | **VOX Record** | Arms/disarms MP3 recording to `~/airscan/recordings/`. |
+| **`[P]`** | **Quick Play** | Replays the most recently recorded audio file. |
+| **`[C]`** | **Clear Log** | Resets channel hit counts, timers, and timestamps. |
+| **`[G]`** | **Cycle Gain** | Steps through supported tuner gain stages. |
+| **`[Q]`** | **Quit** | Cleanly exits and releases USB device locks. |
