@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 AirScan: VHF AM Aviation Radio Scanner & VOX Audio Recorder
-Direct librtlsdr C-bindings, NumPy DSP demodulation, auto-squelch, and NCurses TUI.
+Direct librtlsdr C-bindings, NumPy DSP demodulation, per-channel adaptive auto-squelch, and NCurses TUI.
 """
 
 import os
@@ -26,7 +26,6 @@ SDR_SAMPLE_RATE: int = 1024000
 AUDIO_RATE: int = 32000
 DECIMATION: int = SDR_SAMPLE_RATE // AUDIO_RATE  # 32
 CHUNK_SAMPLES: int = 16384
-BYTES_PER_CHUNK: int = CHUNK_SAMPLES * 2
 
 def _generate_fir_filter(taps: int = 31, cutoff_hz: float = 3200.0, fs: float = SDR_SAMPLE_RATE) -> np.ndarray:
     n = np.arange(taps) - (taps - 1) / 2.0
@@ -47,9 +46,11 @@ class Channel:
     hits: int = 0
     total_airtime_sec: float = 0.0
     last_heard: str = ""
+    noise_floor_db: float = -90.0
+    noise_initialized: bool = False
 
 # =====================================================================
-# C-STDERR SUPPRESSION (Prevents libusb/ALSA logs from corrupting curses)
+# C-STDERR SUPPRESSION
 # =====================================================================
 class CStderrSilencer:
     def __enter__(self):
@@ -149,7 +150,7 @@ class LibRTLSDR:
             self.dev = None
 
 # =====================================================================
-# AUDIO DSP & VOICE BANDPASS FILTER (300 Hz - 3500 Hz)
+# AUDIO DSP & BANDPASS FILTER (300 Hz - 3500 Hz)
 # =====================================================================
 class VoiceBandpassFilter:
     def __init__(self, sample_rate: int = AUDIO_RATE, low_cut: float = 300.0, high_cut: float = 3500.0):
@@ -235,7 +236,7 @@ class AudioRecorder:
             self.process = None
 
 # =====================================================================
-# CORE SCANNER ENGINE
+# CORE AIRSCAN ENGINE
 # =====================================================================
 class AirScanEngine:
     def __init__(self, channels: List[Channel], gain: float = 36.0, squelch_db: float = -45.0,
@@ -244,7 +245,7 @@ class AirScanEngine:
         self.gain = gain
         self.manual_squelch_db = squelch_db
         self.auto_squelch = True
-        self.snr_threshold_db = 8.5
+        self.snr_threshold_db = 7.0
         self.recording_enabled = False
         self.no_audio = no_audio
 
@@ -266,7 +267,6 @@ class AirScanEngine:
         self.hang_count = 0
         self.max_dwell_count = 0
         self.agc_peak = 0.05
-        self.noise_floor_db = -65.0
 
         self.current_rssi = -90.0
         self.current_snr = 0.0
@@ -309,15 +309,31 @@ class AirScanEngine:
         target_gain = min(0.85 / max(self.agc_peak, 0.01), 12.0)
         return np.clip(audio * target_gain, -1.0, 1.0).astype(np.float32)
 
-    def calculate_power(self, iq_samples: np.ndarray) -> Tuple[float, float]:
+    def evaluate_signal(self, iq_samples: np.ndarray, ch: Channel) -> Tuple[float, float, bool, bool]:
         pwr = float(np.mean(np.abs(iq_samples) ** 2))
         rssi_db = 10.0 * math.log10(max(pwr, 1e-12))
-        if rssi_db < self.noise_floor_db:
-            self.noise_floor_db = (self.noise_floor_db * 0.95) + (rssi_db * 0.05)
+
+        if not ch.noise_initialized:
+            ch.noise_floor_db = rssi_db
+            ch.noise_initialized = True
+
+        snr_db = max(0.0, rssi_db - ch.noise_floor_db)
+
+        if self.auto_squelch:
+            trigger = (snr_db >= self.snr_threshold_db)
+            maintain = (snr_db >= max(2.5, self.snr_threshold_db - 3.0))
         else:
-            self.noise_floor_db = (self.noise_floor_db * 0.999) + (rssi_db * 0.001)
-        snr_db = max(0.0, rssi_db - self.noise_floor_db)
-        return rssi_db, snr_db
+            trigger = (rssi_db >= self.manual_squelch_db)
+            maintain = (rssi_db >= (self.manual_squelch_db - 3.0))
+
+        # Only adapt noise floor when no voice signal is detected (freeze during speech)
+        if not self.squelch_open and not trigger:
+            if rssi_db < ch.noise_floor_db:
+                ch.noise_floor_db = (ch.noise_floor_db * 0.85) + (rssi_db * 0.15)
+            else:
+                ch.noise_floor_db = (ch.noise_floor_db * 0.96) + (rssi_db * 0.04)
+
+        return rssi_db, snr_db, trigger, maintain
 
     def toggle_playback(self):
         if self.playback_proc and self.playback_proc.poll() is None:
@@ -356,6 +372,9 @@ class AirScanEngine:
                 break
         self.gain = gains[idx]
         self.sdr.set_gain(self.gain)
+        # Invalidate baseline on gain step
+        for ch in self.channels:
+            ch.noise_initialized = False
 
     def step(self):
         if self.hold_channel:
@@ -372,14 +391,7 @@ class AirScanEngine:
             self.sdr.read_samples(4096)
 
         raw_iq = self.sdr.read_samples(CHUNK_SAMPLES)
-        self.current_rssi, self.current_snr = self.calculate_power(raw_iq)
-
-        if self.auto_squelch:
-            trigger = (self.current_snr >= self.snr_threshold_db)
-            maintain = (self.current_snr >= (self.snr_threshold_db - 3.0))
-        else:
-            trigger = (self.current_rssi >= self.manual_squelch_db)
-            maintain = (self.current_rssi >= (self.manual_squelch_db - 3.0))
+        self.current_rssi, self.current_snr, trigger, maintain = self.evaluate_signal(raw_iq, target)
 
         if trigger or (self.squelch_open and maintain):
             if not self.squelch_open:
@@ -446,6 +458,8 @@ def curses_main(stdscr, scanner: AirScanEngine):
     curses.curs_set(0)
     curses.use_default_colors()
     stdscr.keypad(True)
+    stdscr.scrollok(False)
+    stdscr.idlok(False)
     stdscr.nodelay(True)
     stdscr.timeout(40)
 
@@ -514,9 +528,9 @@ def curses_main(stdscr, scanner: AirScanEngine):
         safe_addstr(stdscr, 1, max(2, (max_x - len(title)) // 2), title, curses.color_pair(6) | curses.A_BOLD)
         safe_addstr(stdscr, 2, 0, "╠" + "═" * (max_x - 2) + "╣", curses.color_pair(7))
 
-        sq_str = f"AUTO ({scanner.snr_threshold_db:.1f} dB)" if scanner.auto_squelch else f"MAN ({scanner.manual_squelch_db:.0f} dBFS)"
+        sq_str = f"AUTO ({scanner.snr_threshold_db:.1f} dB SNR)" if scanner.auto_squelch else f"MAN ({scanner.manual_squelch_db:.0f} dBFS)"
         flt_str = "BPF (300-3.5k)" if scanner.voice_filter.enabled else "RAW (FULL AM)"
-        stat_l1 = f" SQUELCH: [{sq_str:<15}]  GAIN: [{scanner.gain:>4.1f} dB]  FILTER: [{flt_str:<14}]"
+        stat_l1 = f" SQUELCH: [{sq_str:<18}]  GAIN: [{scanner.gain:>4.1f} dB]  FILTER: [{flt_str:<14}]"
         safe_addstr(stdscr, 3, 2, stat_l1, curses.color_pair(6))
 
         sig_bars = max(0, min(15, int((scanner.current_rssi + 75.0) / 3.0)))
@@ -536,11 +550,13 @@ def curses_main(stdscr, scanner: AirScanEngine):
             rec_str = "STANDBY"
             rec_col = curses.A_DIM
 
-        safe_addstr(stdscr, 4, 2, f" SIGNAL: [{smeter}] {scanner.current_rssi:>5.1f} dBFS  STATE: [{act_str:<12}]", act_col)
-        safe_addstr(stdscr, 4, 56, f"VOX: [{rec_str:<15}]", rec_col)
+        sig_str = f" SIGNAL: [{smeter}] {scanner.current_rssi:>5.1f} dBFS (SNR: {scanner.current_snr:>4.1f} dB)"
+        safe_addstr(stdscr, 4, 2, sig_str, act_col)
+        safe_addstr(stdscr, 4, 48, f"STATE: [{act_str:<12}]", act_col)
+        safe_addstr(stdscr, 4, 70, f"VOX: [{rec_str:<12}]", rec_col)
 
         safe_addstr(stdscr, 5, 0, "╠" + "═" * (max_x - 2) + "╣", curses.color_pair(7))
-        table_hdr = "    FREQUENCY   CHANNEL NAME             HITS   AIRTIME   LAST HEARD "
+        table_hdr = "    FREQUENCY   CHANNEL NAME             HITS   AIRTIME   NOISE FLR   LAST HEARD "
         safe_addstr(stdscr, 6, 2, table_hdr, curses.color_pair(6) | curses.A_BOLD)
 
         table_start_row = 7
@@ -581,16 +597,20 @@ def curses_main(stdscr, scanner: AirScanEngine):
             mhz = ch.freq_hz / 1e6
             last_hd = ch.last_heard if ch.last_heard else "--:--:--"
             tot_air = f"{int(ch.total_airtime_sec)}s"
+            nfloor = f"{ch.noise_floor_db:>5.1f} dBFS" if ch.noise_initialized else "  CALIB "
 
-            line_str = f" {prefix} {mhz:7.3f} MHz  {ch.name:<22} {ch.hits:>5}  {tot_air:>7}  {last_hd:>8} "
+            line_str = f" {prefix} {mhz:7.3f} MHz  {ch.name:<22} {ch.hits:>5}  {tot_air:>7}  {nfloor:>9}   {last_hd:>8} "
             safe_addstr(stdscr, r, 2, line_str, attr)
 
-        footer_border_row = max_y - 3
-        footer_keys_row = max_y - 2
+        footer_border_row = max(table_start_row + 1, max_y - 3)
+        footer_keys_row = max(table_start_row + 2, max_y - 2)
+        bottom_row = max(table_start_row + 3, max_y - 1)
+
         safe_addstr(stdscr, footer_border_row, 0, "╠" + "═" * (max_x - 2) + "╣", curses.color_pair(7))
-        help_text = " [SPACE] Hold  [F] Filter  [A] Auto-Sq  [R] Rec  [P] Play  [C] Clear  [G] Gain  [Q] Quit "
+        help_text = " [SPACE] Hold  [F] Filter  [A] Auto-Sq  [+/-] Sens  [R] Rec  [P] Play  [G] Gain  [Q] Quit "
         safe_addstr(stdscr, footer_keys_row, 2, help_text, curses.color_pair(6) | curses.A_BOLD)
-        safe_addstr(stdscr, max_y - 1, 0, "╚" + "═" * (max_x - 2) + "╝", curses.color_pair(7))
+        if bottom_row < max_y:
+            safe_addstr(stdscr, bottom_row, 0, "╚" + "═" * (max_x - 2) + "╝", curses.color_pair(7))
 
         stdscr.refresh()
 
@@ -598,36 +618,38 @@ def curses_main(stdscr, scanner: AirScanEngine):
 # CONFIGURATION & ENTRY POINT
 # =====================================================================
 def load_frequencies(csv_path: str) -> List[Channel]:
+    home_airscan_csv = os.path.expanduser("~/airscan/frequencies.csv")
+    if csv_path == "frequencies.csv" or not os.path.isabs(csv_path):
+        if os.path.exists(home_airscan_csv):
+            csv_path = home_airscan_csv
+        elif not os.path.exists(csv_path):
+            script_real = os.path.realpath(__file__)
+            candidate = os.path.join(os.path.dirname(script_real), "frequencies.csv")
+            csv_path = candidate if os.path.exists(candidate) else home_airscan_csv
+
     if not os.path.exists(csv_path):
-        defaults = [
-            (118.000, "Tower"),
-            (121.500, "Emergency Guard"),
-            (121.900, "Ground Control"),
-            (122.700, "UNICOM"),
-            (122.800, "CTAF Local"),
-            (122.900, "Multicom"),
-            (123.025, "Helicopter Air-Air"),
-            (127.200, "Minneapolis Center"),
-            (134.100, "Approach / Departure")
-        ]
-        with open(csv_path, "w", encoding="utf-8") as f:
-            for mhz, name in defaults:
-                f.write(f"{mhz:.3f},{name}\n")
+        return []
 
     channels: List[Channel] = []
-    with open(csv_path, "r", encoding="utf-8") as f:
+    with open(csv_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith("#"):
+            if not line or line.startswith("#") or line in (",", ";", "\t"):
                 continue
-            parts = line.split(",")
+
+            delim = "," if "," in line else ("\t" if "\t" in line else ";")
+            parts = [p.strip().strip('"').strip("'") for p in line.split(delim)]
+
             if len(parts) >= 2:
                 try:
-                    freq_hz = int(round(float(parts[0].strip()) * 1e6))
-                    name = parts[1].strip()
-                    channels.append(Channel(freq_hz=freq_hz, name=name))
+                    raw_val = float(parts[0])
+                    freq_hz = int(round(raw_val * 1e6)) if raw_val < 1000.0 else int(round(raw_val))
+                    if 24000000 <= freq_hz <= 1700000000:
+                        name = parts[1]
+                        channels.append(Channel(freq_hz=freq_hz, name=name))
                 except ValueError:
                     continue
+
     return channels
 
 def main():
@@ -645,6 +667,13 @@ def main():
     if not channels:
         print(f"[-] Error: No valid frequencies found in {args.config}")
         sys.exit(1)
+
+    try:
+        sys.stdout.write("\x1b[8;28;96t")
+        sys.stdout.flush()
+        time.sleep(0.05)
+    except Exception:
+        pass
 
     scanner = None
     try:
